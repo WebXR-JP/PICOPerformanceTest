@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.picoperftest"
+    android:versionCode="1"
+    android:versionName="1.0"
+    android:installLocation="auto">
+
+    <uses-feature android:glEsVersion="0x00030002" android:required="false" />
+    <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" />
+
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:label="PICOPerfTest"
+        android:hasCode="false">
+        <meta-data android:name="pvr.app.type" android:value="vr" />
+        <meta-data android:name="pvr.sdk.version" android:value="OpenXR" />
+        <meta-data android:name="pxr.sdk.version_code" android:value="590" />
+        <!-- コントローラー不使用・HandTracking使用のため HandDialog を抑制 -->
+        <meta-data android:name="pvr.controller.support" android:value="false" />
+        <meta-data android:name="handtracking" android:value="1" />
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode"
+            android:exported="true">
+            <meta-data android:name="android.app.lib_name" android:value="PICOPerformanceTest" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

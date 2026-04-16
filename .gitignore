@@ -1,0 +1,18 @@
+# Build outputs
+project/android/build/
+project/android/.gradle/
+
+# Local configuration (contains sdk.dir path)
+project/android/local.properties
+
+# Gradle wrapper JAR (large binary)
+project/android/gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+
+# C++ build artifacts
+*.o
+*.a
+*.so
