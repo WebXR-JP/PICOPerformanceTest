@@ -34,6 +34,7 @@
 // 生成したシェーダーヘッダー（ビルド時に cmake/embed_spirv.cmake が生成）
 #include "vertex_spv.h"
 #include "fragment_spv.h"
+#include "culling_spv.h"
 
 // ---- ログマクロ ----
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "PICOPerfTest", __VA_ARGS__)
@@ -108,6 +109,20 @@ struct VulkanCtx {
     VkFence          fence          = VK_NULL_HANDLE;
     // コマンドバッファ（スワップチェーン画像数、multiview で両目を1回で描画）
     std::vector<VkCommandBuffer> cmdBuffers; // [imageIdx]
+
+    // ---- Meshlet Culling (Compute) ----
+    VkBuffer              meshletBuffer        = VK_NULL_HANDLE;
+    VkDeviceMemory        meshletMemory        = VK_NULL_HANDLE;
+    VkBuffer              indirectBuffer       = VK_NULL_HANDLE;
+    VkDeviceMemory        indirectMemory       = VK_NULL_HANDLE;
+    VkBuffer              visibleCountBuffer   = VK_NULL_HANDLE;
+    VkDeviceMemory        visibleCountMemory   = VK_NULL_HANDLE;
+    uint32_t              meshletCount         = 0;
+    VkDescriptorSetLayout computeDescLayout    = VK_NULL_HANDLE;
+    VkDescriptorPool      computeDescPool      = VK_NULL_HANDLE;
+    VkDescriptorSet       computeDescSet       = VK_NULL_HANDLE;
+    VkPipelineLayout      computePipelineLayout = VK_NULL_HANDLE;
+    VkPipeline            computePipeline      = VK_NULL_HANDLE;
 };
 
 // ============================================================
@@ -221,46 +236,128 @@ struct FatVertex {
 };
 
 // ============================================================
-// グリッドメッシュ生成
+// Meshlet 構造体（Compute shader と共有、std430 レイアウト）
 // ============================================================
-static void GenerateGridMesh(VulkanCtx& vk, int N) {
-    // N×N 格子頂点、2*(N-1)^2 三角形
-    const int   vCount = N * N;
-    const int   iCount = (N - 1) * (N - 1) * 6;
-    const float step   = 2.0f / (N - 1); // -1.0 〜 +1.0
+struct Meshlet {
+    glm::vec3 aabbMin;
+    uint32_t  indexOffset;
+    glm::vec3 aabbMax;
+    uint32_t  indexCount;
+    glm::vec3 normal;     // モデル空間の面法線（backface culling 用）
+    uint32_t  _pad;
+};
+static_assert(sizeof(Meshlet) == 48, "Meshlet struct must be 48 bytes (std430)");
 
-    std::vector<FatVertex> verts(vCount);
-    for (int y = 0; y < N; y++) {
-        for (int x = 0; x < N; x++) {
-            FatVertex& v = verts[y * N + x];
-            v.pos    = { -1.0f + x * step, -1.0f + y * step, 0.0f };
-            v.normal = { 0.0f, 0.0f, 1.0f };
-            v.uv     = { (float)x / (N - 1), (float)y / (N - 1) };
+// ============================================================
+// 立方体メッシュ生成（6面それぞれに N×N グリッド、meshlet 分割）
+// ============================================================
+static constexpr int MESHLET_TILE = 16; // 16×16 quads/meshlet = 512 tris
+
+static void GenerateCubeMesh(VulkanCtx& vk, int N) {
+    // 立方体の6面（origin=左下頂点、du=横方向、dv=縦方向、反時計回りで外向き法線）
+    struct Face { glm::vec3 origin, du, dv; };
+    const Face faces[6] = {
+        { glm::vec3( 1,-1,-1), glm::vec3( 0, 0, 2), glm::vec3( 0, 2, 0) }, // +X
+        { glm::vec3(-1,-1, 1), glm::vec3( 0, 0,-2), glm::vec3( 0, 2, 0) }, // -X
+        { glm::vec3(-1, 1,-1), glm::vec3( 2, 0, 0), glm::vec3( 0, 0, 2) }, // +Y
+        { glm::vec3(-1,-1, 1), glm::vec3( 2, 0, 0), glm::vec3( 0, 0,-2) }, // -Y
+        { glm::vec3( 1,-1, 1), glm::vec3(-2, 0, 0), glm::vec3( 0, 2, 0) }, // +Z
+        { glm::vec3(-1,-1,-1), glm::vec3( 2, 0, 0), glm::vec3( 0, 2, 0) }, // -Z
+    };
+
+    // 端数は切り捨て（TILEの倍数になる範囲のみメッシュ化）
+    const int tiles        = (N - 1) / MESHLET_TILE;
+    const int Nfit         = tiles * MESHLET_TILE + 1;
+    const int vPerFace     = Nfit * Nfit;
+    const int iPerMeshlet  = MESHLET_TILE * MESHLET_TILE * 6;
+    const int mPerFace     = tiles * tiles;
+    const int totalVerts    = vPerFace * 6;
+    const int totalIdx      = iPerMeshlet * mPerFace * 6;
+    const int totalMeshlets = mPerFace * 6;
+
+    std::vector<FatVertex> verts(totalVerts);
+    std::vector<uint32_t>  indices(totalIdx);
+    std::vector<Meshlet>   meshlets(totalMeshlets);
+
+    for (int f = 0; f < 6; f++) {
+        const Face& face   = faces[f];
+        // 外向き法線: du,dv の定義上 cross(dv, du) が正しい向きになる
+        const glm::vec3 fN = glm::normalize(glm::cross(face.dv, face.du));
+        const int   vBase = f * vPerFace;
+        const int   iBase = f * iPerMeshlet * mPerFace;
+        const int   mBase = f * mPerFace;
+
+        // 頂点
+        for (int y = 0; y < Nfit; y++) {
+            for (int x = 0; x < Nfit; x++) {
+                float u = (float)x / (Nfit - 1);
+                float v = (float)y / (Nfit - 1);
+                FatVertex& vv = verts[vBase + y * Nfit + x];
+                vv.pos    = face.origin + u * face.du + v * face.dv;
+                vv.normal = fN;
+                vv.uv     = { u, v };
+            }
+        }
+
+        // meshlet順にインデックスとAABB
+        int iOff = iBase;
+        for (int my = 0; my < tiles; my++) {
+            for (int mx = 0; mx < tiles; mx++) {
+                uint32_t offsetStart = (uint32_t)iOff;
+                for (int ty = 0; ty < MESHLET_TILE; ty++) {
+                    for (int tx = 0; tx < MESHLET_TILE; tx++) {
+                        int xi = mx * MESHLET_TILE + tx;
+                        int yi = my * MESHLET_TILE + ty;
+                        uint32_t tl = (uint32_t)(vBase + yi * Nfit + xi);
+                        uint32_t tr = tl + 1;
+                        uint32_t bl = tl + Nfit;
+                        uint32_t br = bl + 1;
+                        indices[iOff++] = tl; indices[iOff++] = bl; indices[iOff++] = tr;
+                        indices[iOff++] = tr; indices[iOff++] = bl; indices[iOff++] = br;
+                    }
+                }
+                // meshlet AABB（モデル空間）
+                glm::vec3 pMin( 1e9f);
+                glm::vec3 pMax(-1e9f);
+                for (int ty = 0; ty <= MESHLET_TILE; ty++) {
+                    for (int tx = 0; tx <= MESHLET_TILE; tx++) {
+                        int xi = mx * MESHLET_TILE + tx;
+                        int yi = my * MESHLET_TILE + ty;
+                        float u = (float)xi / (Nfit - 1);
+                        float v = (float)yi / (Nfit - 1);
+                        glm::vec3 p = face.origin + u * face.du + v * face.dv;
+                        pMin = glm::min(pMin, p);
+                        pMax = glm::max(pMax, p);
+                    }
+                }
+                // 退化軸を膨らませる
+                for (int i = 0; i < 3; i++) {
+                    if (pMax[i] - pMin[i] < 1e-4f) {
+                        pMin[i] -= 0.001f;
+                        pMax[i] += 0.001f;
+                    }
+                }
+                Meshlet& m = meshlets[mBase + my * tiles + mx];
+                m.aabbMin     = pMin;
+                m.aabbMax     = pMax;
+                m.indexOffset = offsetStart;
+                m.indexCount  = (uint32_t)iPerMeshlet;
+                m.normal      = fN;
+                m._pad        = 0;
+            }
         }
     }
+    vk.meshletCount = (uint32_t)totalMeshlets;
 
-    std::vector<uint32_t> indices(iCount);
-    int idx = 0;
-    for (int y = 0; y < N - 1; y++) {
-        for (int x = 0; x < N - 1; x++) {
-            uint32_t tl = y * N + x;
-            uint32_t tr = tl + 1;
-            uint32_t bl = tl + N;
-            uint32_t br = bl + 1;
-            indices[idx++] = tl; indices[idx++] = bl; indices[idx++] = tr;
-            indices[idx++] = tr; indices[idx++] = bl; indices[idx++] = br;
-        }
-    }
+    vk.vertexCount = (uint32_t)totalVerts;
+    vk.indexCount  = (uint32_t)totalIdx;
 
-    vk.vertexCount = (uint32_t)vCount;
-    vk.indexCount  = (uint32_t)iCount;
-
-    int polyCount = (N - 1) * (N - 1) * 2;
-    LOGI("Mesh: %d x %d grid, %d vertices, %d indices (%d polygons)",
-         N, N, vCount, iCount, polyCount);
+    int polyCount = totalMeshlets * MESHLET_TILE * MESHLET_TILE * 2;
+    LOGI("Cube mesh: %d verts, %d idx, %d polys, %d meshlets (6 faces x %dx%d)",
+         totalVerts, totalIdx, polyCount, totalMeshlets, tiles, tiles);
 
     // 頂点バッファ（HOST_VISIBLE で直接書き込み）
-    VkDeviceSize vSize = sizeof(FatVertex) * vCount;
+    VkDeviceSize vSize = sizeof(FatVertex) * totalVerts;
     CreateBuffer(vk, vSize,
                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -271,7 +368,7 @@ static void GenerateGridMesh(VulkanCtx& vk, int N) {
     vkUnmapMemory(vk.device, vk.vertexMemory);
 
     // インデックスバッファ
-    VkDeviceSize iSize = sizeof(uint32_t) * iCount;
+    VkDeviceSize iSize = sizeof(uint32_t) * totalIdx;
     CreateBuffer(vk, iSize,
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -280,6 +377,31 @@ static void GenerateGridMesh(VulkanCtx& vk, int N) {
     vkMapMemory(vk.device, vk.indexMemory, 0, iSize, 0, &iPtr);
     memcpy(iPtr, indices.data(), iSize);
     vkUnmapMemory(vk.device, vk.indexMemory);
+
+    // ---- Meshlet SSBO（CPU -> GPU、read-only in compute）----
+    VkDeviceSize mSize = sizeof(Meshlet) * totalMeshlets;
+    CreateBuffer(vk, mSize,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 vk.meshletBuffer, vk.meshletMemory);
+    void* mPtr;
+    vkMapMemory(vk.device, vk.meshletMemory, 0, mSize, 0, &mPtr);
+    memcpy(mPtr, meshlets.data(), mSize);
+    vkUnmapMemory(vk.device, vk.meshletMemory);
+
+    // ---- Indirect buffer（compute が書く、draw が読む）----
+    VkDeviceSize drawCmdStride = 5 * sizeof(uint32_t); // VkDrawIndexedIndirectCommand = 20 bytes
+    VkDeviceSize iSizeIndirect = drawCmdStride * totalMeshlets;
+    CreateBuffer(vk, iSizeIndirect,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 vk.indirectBuffer, vk.indirectMemory);
+
+    // ---- Visible counter buffer（CPU から確認できるよう HOST_VISIBLE に）----
+    CreateBuffer(vk, sizeof(uint32_t),
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 vk.visibleCountBuffer, vk.visibleCountMemory);
 }
 
 // ============================================================
@@ -293,6 +415,8 @@ struct App {
     int           gridN       = GRID_N; // Intent の "grid_n" で上書き可能
     int           instCount   = 1;      // Intent の "inst_count" で上書き可能
     int           aluIters    = 0;      // Intent の "alu_iters" で上書き可能
+    int           cullEnabled = 1;      // Intent の "cull" で上書き可能（0=無効）
+    uint32_t      lastVisibleCount = 0; // 前フレームの可視 meshlet 数（ログ用）
 
     // フレーム計測
     using Clock = std::chrono::high_resolution_clock;
@@ -687,6 +811,81 @@ static void CreatePipeline(App& app, uint32_t width, uint32_t height) {
     LOGI("GraphicsPipeline created");
 }
 
+// ---- Compute パイプライン作成（meshlet culling） ----
+static void CreateComputePipeline(App& app) {
+    // Descriptor set layout: 3 storage buffers
+    VkDescriptorSetLayoutBinding bindings[3]{};
+    for (uint32_t i = 0; i < 3; i++) {
+        bindings[i].binding         = i;
+        bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI.bindingCount = 3;
+    dslCI.pBindings    = bindings;
+    CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.computeDescLayout));
+
+    // Descriptor pool + set
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    VkDescriptorPoolCreateInfo dpCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpCI.maxSets       = 1;
+    dpCI.poolSizeCount = 1;
+    dpCI.pPoolSizes    = &poolSize;
+    CHECK_VK(vkCreateDescriptorPool(app.vk.device, &dpCI, nullptr, &app.vk.computeDescPool));
+
+    VkDescriptorSetAllocateInfo dsAI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsAI.descriptorPool     = app.vk.computeDescPool;
+    dsAI.descriptorSetCount = 1;
+    dsAI.pSetLayouts        = &app.vk.computeDescLayout;
+    CHECK_VK(vkAllocateDescriptorSets(app.vk.device, &dsAI, &app.vk.computeDescSet));
+
+    // Descriptor set を書き込む
+    VkDescriptorBufferInfo bufInfos[3] = {
+        { app.vk.meshletBuffer,      0, VK_WHOLE_SIZE },
+        { app.vk.indirectBuffer,     0, VK_WHOLE_SIZE },
+        { app.vk.visibleCountBuffer, 0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet writes[3]{};
+    for (uint32_t i = 0; i < 3; i++) {
+        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet          = app.vk.computeDescSet;
+        writes[i].dstBinding      = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo     = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(app.vk.device, 3, writes, 0, nullptr);
+
+    // Pipeline layout: push constant = mat4[2] + vec4 + uint*4 = 160 bytes
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0,
+        sizeof(glm::mat4) * 2 + sizeof(glm::vec4) + sizeof(uint32_t) * 4};
+    VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plCI.setLayoutCount         = 1;
+    plCI.pSetLayouts            = &app.vk.computeDescLayout;
+    plCI.pushConstantRangeCount = 1;
+    plCI.pPushConstantRanges    = &pcRange;
+    CHECK_VK(vkCreatePipelineLayout(app.vk.device, &plCI, nullptr, &app.vk.computePipelineLayout));
+
+    // Shader module
+    VkShaderModuleCreateInfo smCI{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smCI.codeSize = culling_spv_size;
+    smCI.pCode    = culling_spv;
+    VkShaderModule mod;
+    CHECK_VK(vkCreateShaderModule(app.vk.device, &smCI, nullptr, &mod));
+
+    VkComputePipelineCreateInfo cpCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpCI.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpCI.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpCI.stage.module = mod;
+    cpCI.stage.pName  = "main";
+    cpCI.layout       = app.vk.computePipelineLayout;
+    CHECK_VK(vkCreateComputePipelines(app.vk.device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &app.vk.computePipeline));
+
+    vkDestroyShaderModule(app.vk.device, mod, nullptr);
+    LOGI("ComputePipeline (culling) created");
+}
+
 // ---- ImageView / Framebuffer / CommandBuffer を作成（multiview: 1 swapchain） ----
 static void CreateFrameResources(App& app, VkFormat colorFormat) {
     // コマンドプール
@@ -784,16 +983,24 @@ static void Initialize(App& app) {
     uint32_t h = app.xr.swapchains[0].height;
     CreatePipeline(app, w, h);
     CreateFrameResources(app, colorFormat);
-    GenerateGridMesh(app.vk, app.gridN);
+    GenerateCubeMesh(app.vk, app.gridN);
+    CreateComputePipeline(app);
 
     app.initialized = true;
     app.lastLogTime = App::Clock::now();
-    LOGI("=== Initialization complete. GRID_N=%d, polygons≈%d ===",
-         app.gridN, (app.gridN - 1) * (app.gridN - 1) * 2);
+    LOGI("=== Initialization complete. GRID_N=%d, meshlets=%u ===",
+         app.gridN, app.vk.meshletCount);
 }
 
-// ---- XrView から MVP 行列を計算（view_mat 不使用：カメラ空間固定）----
-static glm::mat4 ComputeMVP(const XrView& view) {
+// 立方体のモデル行列（world 空間固定）
+static glm::mat4 CubeModelMatrix() {
+    return glm::translate(glm::mat4(1.f), glm::vec3(0.f, 0.f, -3.f))
+         * glm::scale(glm::mat4(1.f), glm::vec3(1.5f, 1.5f, 1.5f));
+}
+
+// ---- XrView から MVP 行列を計算 ----
+static glm::mat4 ComputeMVP(const XrView& view, const glm::mat4& model) {
+    // Projection（非対称フラスタム）
     const XrFovf& fov = view.fov;
     float l = tanf(fov.angleLeft);
     float r = tanf(fov.angleRight);
@@ -809,9 +1016,14 @@ static glm::mat4 ComputeMVP(const XrView& view) {
     proj[2][3] = -1.f;
     proj[3][2] = -(2.f * zFar * zNear) / (zFar - zNear);
 
-    glm::mat4 model = glm::translate(glm::mat4(1.f), glm::vec3(0.f, 0.f, -3.f))
-                    * glm::scale(glm::mat4(1.f), glm::vec3(2.f, 2.f, 1.f));
-    return proj * model;
+    // View（頭のpose）
+    const XrQuaternionf& q = view.pose.orientation;
+    const XrVector3f&    p = view.pose.position;
+    glm::mat4 rot   = glm::mat4_cast(glm::quat(q.w, q.x, q.y, q.z));
+    glm::mat4 trans = glm::translate(glm::mat4(1.f), glm::vec3(p.x, p.y, p.z));
+    glm::mat4 view_mat = glm::inverse(trans * rot);
+
+    return proj * view_mat * model;
 }
 
 // ---- 両目をまとめて描画（multiview: 1 draw call で左右同時） ----
@@ -825,6 +1037,65 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     CHECK_VK(vkBeginCommandBuffer(cmd, &bi));
 
+    glm::mat4 model = CubeModelMatrix();
+    glm::mat4 mvp0  = ComputeMVP(views[0], model);
+    glm::mat4 mvp1  = ComputeMVP(views[1], model);
+
+    // モデル空間のカメラ位置（両目の中央）= backface culling 用
+    glm::vec3 camWorld(
+        0.5f * (views[0].pose.position.x + views[1].pose.position.x),
+        0.5f * (views[0].pose.position.y + views[1].pose.position.y),
+        0.5f * (views[0].pose.position.z + views[1].pose.position.z));
+    glm::vec3 camLocal = glm::vec3(glm::inverse(model) * glm::vec4(camWorld, 1.f));
+
+    // ---- Compute: meshlet culling → indirect buffer を構築 ----
+    // visibleCount をゼロクリア
+    vkCmdFillBuffer(cmd, app.vk.visibleCountBuffer, 0, sizeof(uint32_t), 0);
+    VkMemoryBarrier fillToCs{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    fillToCs.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    fillToCs.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &fillToCs, 0, nullptr, 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.computePipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            app.vk.computePipelineLayout, 0, 1,
+                            &app.vk.computeDescSet, 0, nullptr);
+
+    struct CsPushConst {
+        glm::mat4 mvp[2];
+        glm::vec4 camLocal;      // .xyz = モデル空間カメラ位置
+        uint32_t  meshletCount;
+        uint32_t  instanceCount;
+        uint32_t  cullEnabled;
+        uint32_t  _pad;
+    };
+    CsPushConst cspc;
+    cspc.mvp[0]        = mvp0;
+    cspc.mvp[1]        = mvp1;
+    cspc.camLocal      = glm::vec4(camLocal, 0.0f);
+    cspc.meshletCount  = app.vk.meshletCount;
+    cspc.instanceCount = (uint32_t)app.instCount;
+    cspc.cullEnabled   = (uint32_t)app.cullEnabled;
+    cspc._pad          = 0;
+    vkCmdPushConstants(cmd, app.vk.computePipelineLayout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cspc), &cspc);
+
+    uint32_t groupCount = (app.vk.meshletCount + 63) / 64;
+    vkCmdDispatch(cmd, groupCount, 1, 1);
+
+    // Compute → Indirect/Vertex shader のバリア
+    VkMemoryBarrier csToDraw{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    csToDraw.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    csToDraw.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+        0, 1, &csToDraw, 0, nullptr, 0, nullptr);
+
+    // ---- Graphics: indirect draw ----
     VkClearValue clears[2];
     clears[0].color        = {0.1f, 0.1f, 0.15f, 1.0f};
     clears[1].depthStencil = {1.0f, 0};
@@ -840,20 +1111,22 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     vkCmdBeginRenderPass(cmd, &rpBI, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipeline);
 
-    // 両目の MVP を push constants に詰める
-    struct PushConst { glm::mat4 mvp[2]; int32_t aluIters; };
-    PushConst pc;
-    pc.mvp[0]   = ComputeMVP(views[0]);
-    pc.mvp[1]   = ComputeMVP(views[1]);
+    struct GfxPushConst { glm::mat4 mvp[2]; int32_t aluIters; };
+    GfxPushConst pc;
+    pc.mvp[0]   = mvp0;
+    pc.mvp[1]   = mvp1;
     pc.aluIters = (int32_t)app.aluIters;
     vkCmdPushConstants(cmd, app.vk.pipelineLayout,
-                       VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(PushConst), &pc);
+                       VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
 
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &app.vk.vertexBuffer, &offset);
     vkCmdBindIndexBuffer(cmd, app.vk.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-    // multiview: 1 draw call で gl_ViewIndex=0,1 両方が走る
-    vkCmdDrawIndexed(cmd, app.vk.indexCount, (uint32_t)app.instCount, 0, 0, 0);
+
+    // indirect draw: 全meshlet数ぶんのコマンドを発行、不可視は indexCount=0 でスキップされる
+    const uint32_t drawCmdStride = 5 * sizeof(uint32_t);
+    vkCmdDrawIndexedIndirect(cmd, app.vk.indirectBuffer, 0,
+                             app.vk.meshletCount, drawCmdStride);
 
     vkCmdEndRenderPass(cmd);
     CHECK_VK(vkEndCommandBuffer(cmd));
@@ -914,6 +1187,15 @@ static void RenderFrame(App& app) {
 
         // フェンス待機 & リセット
         vkWaitForFences(app.vk.device, 1, &app.vk.fence, VK_TRUE, UINT64_MAX);
+
+        // 可視 meshlet 数を CPU に読み出す（直前フレームの結果）
+        {
+            void* p = nullptr;
+            vkMapMemory(app.vk.device, app.vk.visibleCountMemory, 0,
+                        sizeof(uint32_t), 0, &p);
+            app.lastVisibleCount = *reinterpret_cast<uint32_t*>(p);
+            vkUnmapMemory(app.vk.device, app.vk.visibleCountMemory);
+        }
         vkResetFences(app.vk.device, 1, &app.vk.fence);
 
         // キューサブミット（コマンドバッファ1つ）
@@ -950,15 +1232,9 @@ static void RenderFrame(App& app) {
     if (elapsed >= 1.0) {
         double avgMs    = app.frameMsAccum / app.frameCount;
         double fps      = app.frameCount / elapsed;
-        int    polysInst = (app.gridN - 1) * (app.gridN - 1) * 2;
-        int    polysTotal = polysInst * app.instCount;
-        if (app.instCount > 1) {
-            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  Polygons=%d  (inst=%d x %d poly)",
-                 fps, avgMs, polysTotal, app.instCount, polysInst);
-        } else {
-            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  Polygons=%d  Vertices=%d",
-                 fps, avgMs, polysTotal, (int)app.vk.vertexCount);
-        }
+        int    polysTotal = (int)app.vk.meshletCount * MESHLET_TILE * MESHLET_TILE * 2 * app.instCount;
+        LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  Polys=%d  Meshlets=%u/%u  cull=%d",
+             fps, avgMs, polysTotal, app.lastVisibleCount, app.vk.meshletCount, app.cullEnabled);
         app.frameMsAccum = 0.0;
         app.frameCount   = 0;
         app.lastLogTime  = t1;
@@ -1030,6 +1306,18 @@ static void Cleanup(App& app) {
         if (app.vk.indexBuffer)    vkDestroyBuffer(app.vk.device, app.vk.indexBuffer, nullptr);
         if (app.vk.indexMemory)    vkFreeMemory(app.vk.device, app.vk.indexMemory, nullptr);
 
+        if (app.vk.meshletBuffer)      vkDestroyBuffer(app.vk.device, app.vk.meshletBuffer, nullptr);
+        if (app.vk.meshletMemory)      vkFreeMemory(app.vk.device, app.vk.meshletMemory, nullptr);
+        if (app.vk.indirectBuffer)     vkDestroyBuffer(app.vk.device, app.vk.indirectBuffer, nullptr);
+        if (app.vk.indirectMemory)     vkFreeMemory(app.vk.device, app.vk.indirectMemory, nullptr);
+        if (app.vk.visibleCountBuffer) vkDestroyBuffer(app.vk.device, app.vk.visibleCountBuffer, nullptr);
+        if (app.vk.visibleCountMemory) vkFreeMemory(app.vk.device, app.vk.visibleCountMemory, nullptr);
+
+        if (app.vk.computePipeline)       vkDestroyPipeline(app.vk.device, app.vk.computePipeline, nullptr);
+        if (app.vk.computePipelineLayout) vkDestroyPipelineLayout(app.vk.device, app.vk.computePipelineLayout, nullptr);
+        if (app.vk.computeDescPool)       vkDestroyDescriptorPool(app.vk.device, app.vk.computeDescPool, nullptr);
+        if (app.vk.computeDescLayout)     vkDestroyDescriptorSetLayout(app.vk.device, app.vk.computeDescLayout, nullptr);
+
         for (auto& sc : app.xr.swapchains) {
             for (auto& si : sc.images) {
                 if (si.framebuffer) vkDestroyFramebuffer(app.vk.device, si.framebuffer, nullptr);
@@ -1061,7 +1349,7 @@ static void Cleanup(App& app) {
 //   adb shell am start -n com.example.picoperftest/android.app.NativeActivity \
 //       --ei grid_n 17 --ei inst_count 10000
 // ============================================================
-static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount, int& outAluIters) {
+static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount, int& outAluIters, int& outCull) {
     JNIEnv* env = nullptr;
     aApp->activity->vm->AttachCurrentThread(&env, nullptr);
 
@@ -1086,6 +1374,10 @@ static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount,
     jint    aluIters = env->CallIntMethod(intent, getIntExtra, keyAlu, (jint)outAluIters);
     env->DeleteLocalRef(keyAlu);
 
+    jstring keyCull  = env->NewStringUTF("cull");
+    jint    cull     = env->CallIntMethod(intent, getIntExtra, keyCull, (jint)outCull);
+    env->DeleteLocalRef(keyCull);
+
     env->DeleteLocalRef(intent);
     env->DeleteLocalRef(actClass);
     aApp->activity->vm->DetachCurrentThread();
@@ -1101,6 +1393,7 @@ static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount,
         outInstCount = (int)instCount;
     }
     if (aluIters >= 0) outAluIters = (int)aluIters;
+    if (cull == 0 || cull == 1) outCull = (int)cull;
 }
 
 // ============================================================
@@ -1128,10 +1421,11 @@ void android_main(android_app* aApp) {
     if (aApp->destroyRequested) return;
 
     // Intent エクストラを読んでパラメータを設定
-    GetIntentParams(aApp, app.gridN, app.instCount, app.aluIters);
+    GetIntentParams(aApp, app.gridN, app.instCount, app.aluIters, app.cullEnabled);
     int polysPerInst = (app.gridN - 1) * (app.gridN - 1) * 2;
-    LOGI("grid_n=%d  inst_count=%d  alu_iters=%d  polygons≈%d (total≈%d)",
-         app.gridN, app.instCount, app.aluIters, polysPerInst, polysPerInst * app.instCount);
+    LOGI("grid_n=%d  inst_count=%d  alu_iters=%d  cull=%d  polygons≈%d (total≈%d)",
+         app.gridN, app.instCount, app.aluIters, app.cullEnabled,
+         polysPerInst, polysPerInst * app.instCount);
 
     // OpenXR ローダーおよびランタイムへの接続に JNI スレッドのアタッチが必要。
     // PICO SDK フレームワーク (BasicOpenXrWrapper) は xrInitializeLoaderKHR の前に

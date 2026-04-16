@@ -1,0 +1,89 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+struct Meshlet {
+    vec3 aabbMin;
+    uint indexOffset;
+    vec3 aabbMax;
+    uint indexCount;
+    vec3 normal;         // モデル空間の面法線（backface culling 用）
+    uint _pad;
+};
+
+struct DrawCmd {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+layout(std430, binding = 0) readonly  buffer MeshletBuf  { Meshlet meshlets[]; };
+layout(std430, binding = 1) writeonly buffer IndirectBuf { DrawCmd commands[]; };
+layout(std430, binding = 2) coherent  buffer VisibleBuf  { uint    visibleCount; };
+
+layout(push_constant) uniform PushConstants {
+    mat4 mvp[2];         // 左右目のMVP
+    vec4 camLocal;       // .xyz = モデル空間のカメラ位置
+    uint meshletCount;
+    uint instanceCount;
+    uint cullEnabled;    // 0 = カリング無効、1 = 有効（frustum + backface）
+    uint _pad;
+} pc;
+
+// AABBを mvp でクリップ空間に変換し、視錐台内か判定する
+bool aabbInFrustum(vec3 aMin, vec3 aMax, mat4 mvp) {
+    vec4 c[8];
+    c[0] = mvp * vec4(aMin.x, aMin.y, aMin.z, 1.0);
+    c[1] = mvp * vec4(aMax.x, aMin.y, aMin.z, 1.0);
+    c[2] = mvp * vec4(aMin.x, aMax.y, aMin.z, 1.0);
+    c[3] = mvp * vec4(aMax.x, aMax.y, aMin.z, 1.0);
+    c[4] = mvp * vec4(aMin.x, aMin.y, aMax.z, 1.0);
+    c[5] = mvp * vec4(aMax.x, aMin.y, aMax.z, 1.0);
+    c[6] = mvp * vec4(aMin.x, aMax.y, aMax.z, 1.0);
+    c[7] = mvp * vec4(aMax.x, aMax.y, aMax.z, 1.0);
+
+    bool outL = true, outR = true, outB = true, outT = true, outN = true, outF = true;
+    for (int i = 0; i < 8; i++) {
+        if (c[i].x >= -c[i].w) outL = false;
+        if (c[i].x <=  c[i].w) outR = false;
+        if (c[i].y >= -c[i].w) outB = false;
+        if (c[i].y <=  c[i].w) outT = false;
+        if (c[i].z >= 0.0)     outN = false;
+        if (c[i].z <=  c[i].w) outF = false;
+    }
+    return !(outL || outR || outB || outT || outN || outF);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.meshletCount) return;
+
+    Meshlet m = meshlets[idx];
+
+    bool vis = true;
+    if (pc.cullEnabled != 0u) {
+        // Frustum culling
+        vis = aabbInFrustum(m.aabbMin, m.aabbMax, pc.mvp[0])
+           || aabbInFrustum(m.aabbMin, m.aabbMax, pc.mvp[1]);
+
+        // Backface culling（モデル空間）
+        // 法線がカメラと同方向（dot > 0）なら裏向き
+        if (vis) {
+            vec3 center = (m.aabbMin + m.aabbMax) * 0.5;
+            vec3 dir    = center - pc.camLocal.xyz;
+            if (dot(dir, m.normal) > 0.0) vis = false;
+        }
+    }
+
+    DrawCmd cmd;
+    cmd.indexCount    = vis ? m.indexCount : 0u;
+    cmd.instanceCount = vis ? pc.instanceCount : 0u;
+    cmd.firstIndex    = m.indexOffset;
+    cmd.vertexOffset  = 0;
+    cmd.firstInstance = 0;
+    commands[idx] = cmd;
+
+    if (vis) atomicAdd(visibleCount, 1u);
+}

@@ -59,6 +59,7 @@ endfunction()
 
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/vertex.vert" vertex_spv)
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/fragment.frag" fragment_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/culling.comp" culling_spv)
 
 # ---- android_native_app_glue（静的ライブラリ）----
 add_library(app_glue STATIC
@@ -73,6 +74,7 @@ add_library(PICOPerformanceTest MODULE
     # シェーダーヘッダーを依存として追加（カスタムコマンドを確実にトリガーする）
     "${SHADER_GEN_DIR}/vertex_spv.h"
     "${SHADER_GEN_DIR}/fragment_spv.h"
+    "${SHADER_GEN_DIR}/culling_spv.h"
 )
 
 target_include_directories(PICOPerformanceTest PRIVATE
