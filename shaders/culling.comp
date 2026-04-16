@@ -77,13 +77,15 @@ void main() {
         }
     }
 
-    DrawCmd cmd;
-    cmd.indexCount    = vis ? m.indexCount : 0u;
-    cmd.instanceCount = vis ? pc.instanceCount : 0u;
-    cmd.firstIndex    = m.indexOffset;
-    cmd.vertexOffset  = 0;
-    cmd.firstInstance = 0;
-    commands[idx] = cmd;
-
-    if (vis) atomicAdd(visibleCount, 1u);
+    // 可視なら先頭から詰めて書き込む（compact）
+    if (vis) {
+        uint slot = atomicAdd(visibleCount, 1u);
+        DrawCmd cmd;
+        cmd.indexCount    = m.indexCount;
+        cmd.instanceCount = pc.instanceCount;
+        cmd.firstIndex    = m.indexOffset;
+        cmd.vertexOffset  = 0;
+        cmd.firstInstance = 0;
+        commands[slot] = cmd;
+    }
 }

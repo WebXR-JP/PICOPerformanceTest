@@ -147,6 +147,8 @@ static PFN_xrCreateVulkanInstanceKHR            pfn_xrCreateVulkanInstanceKHR   
 static PFN_xrGetVulkanGraphicsDevice2KHR        pfn_xrGetVulkanGraphicsDevice2KHR       = nullptr;
 static PFN_xrCreateVulkanDeviceKHR              pfn_xrCreateVulkanDeviceKHR             = nullptr;
 
+static PFN_vkCmdDrawIndexedIndirectCountKHR     pfn_vkCmdDrawIndexedIndirectCountKHR     = nullptr;
+
 static void LoadXrExtFunctions(XrInstance instance) {
     CHECK_XR(xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsRequirements2KHR",
         (PFN_xrVoidFunction*)&pfn_xrGetVulkanGraphicsRequirements2KHR));
@@ -397,9 +399,11 @@ static void GenerateCubeMesh(VulkanCtx& vk, int N) {
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                  vk.indirectBuffer, vk.indirectMemory);
 
-    // ---- Visible counter buffer（CPU から確認できるよう HOST_VISIBLE に）----
+    // ---- Visible counter buffer（indirect count buffer としても使用）----
     CreateBuffer(vk, sizeof(uint32_t),
-                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  vk.visibleCountBuffer, vk.visibleCountMemory);
 }
@@ -535,15 +539,40 @@ static void CreateVulkanDevice(App& app) {
     qci.queueCount       = 1;
     qci.pQueuePriorities = &priority;
 
+    // VK_KHR_draw_indirect_count サポート確認
+    {
+        uint32_t extCount = 0;
+        vkEnumerateDeviceExtensionProperties(app.vk.physDevice, nullptr, &extCount, nullptr);
+        std::vector<VkExtensionProperties> exts(extCount);
+        vkEnumerateDeviceExtensionProperties(app.vk.physDevice, nullptr, &extCount, exts.data());
+        bool found = false;
+        for (auto& e : exts) {
+            if (strcmp(e.extensionName, VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) == 0) {
+                found = true; break;
+            }
+        }
+        LOGI("VK_KHR_draw_indirect_count: %s", found ? "YES" : "NO");
+        if (!found) { LOGE("VK_KHR_draw_indirect_count not supported"); assert(false); }
+    }
+
     // multiview feature を有効化
     VkPhysicalDeviceMultiviewFeatures multiviewFeatures{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES};
     multiviewFeatures.multiview = VK_TRUE;
 
+    // multiDrawIndirect feature（drawCount > 1 の indirect draw に必須）
+    VkPhysicalDeviceFeatures enabledFeatures{};
+    enabledFeatures.multiDrawIndirect = VK_TRUE;
+
+    const char* deviceExtensions[] = { VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME };
+
     VkDeviceCreateInfo devCI{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    devCI.pNext                = &multiviewFeatures;
-    devCI.queueCreateInfoCount = 1;
-    devCI.pQueueCreateInfos    = &qci;
+    devCI.pNext                    = &multiviewFeatures;
+    devCI.queueCreateInfoCount     = 1;
+    devCI.pQueueCreateInfos        = &qci;
+    devCI.pEnabledFeatures         = &enabledFeatures;
+    devCI.enabledExtensionCount    = 1;
+    devCI.ppEnabledExtensionNames  = deviceExtensions;
 
     XrVulkanDeviceCreateInfoKHR xrDevCI{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
     xrDevCI.systemId               = app.xr.systemId;
@@ -557,6 +586,14 @@ static void CreateVulkanDevice(App& app) {
     LOGI("VkDevice created");
 
     vkGetDeviceQueue(app.vk.device, app.vk.queueFamily, 0, &app.vk.queue);
+
+    // VK_KHR_draw_indirect_count の関数ポインタ取得
+    pfn_vkCmdDrawIndexedIndirectCountKHR = (PFN_vkCmdDrawIndexedIndirectCountKHR)
+        vkGetDeviceProcAddr(app.vk.device, "vkCmdDrawIndexedIndirectCountKHR");
+    if (!pfn_vkCmdDrawIndexedIndirectCountKHR) {
+        LOGE("vkCmdDrawIndexedIndirectCountKHR not found");
+        assert(false);
+    }
 }
 
 // ---- XrSession 作成 ----
@@ -1123,10 +1160,12 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     vkCmdBindVertexBuffers(cmd, 0, 1, &app.vk.vertexBuffer, &offset);
     vkCmdBindIndexBuffer(cmd, app.vk.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
 
-    // indirect draw: 全meshlet数ぶんのコマンドを発行、不可視は indexCount=0 でスキップされる
+    // indirect draw: visibleCountBuffer に書かれた数だけ発行（compute で compact 済み）
     const uint32_t drawCmdStride = 5 * sizeof(uint32_t);
-    vkCmdDrawIndexedIndirect(cmd, app.vk.indirectBuffer, 0,
-                             app.vk.meshletCount, drawCmdStride);
+    pfn_vkCmdDrawIndexedIndirectCountKHR(cmd,
+        app.vk.indirectBuffer,     0,               // indirect commands
+        app.vk.visibleCountBuffer, 0,               // count buffer
+        app.vk.meshletCount,       drawCmdStride);
 
     vkCmdEndRenderPass(cmd);
     CHECK_VK(vkEndCommandBuffer(cmd));
