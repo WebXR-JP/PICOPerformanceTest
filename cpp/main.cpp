@@ -106,8 +106,8 @@ struct VulkanCtx {
     uint32_t         indexCount     = 0;
     uint32_t         vertexCount    = 0;
     VkFence          fence          = VK_NULL_HANDLE;
-    // コマンドバッファ（左右目 × スワップチェーン画像数）
-    std::vector<std::vector<VkCommandBuffer>> cmdBuffers; // [eye][imageIdx]
+    // コマンドバッファ（スワップチェーン画像数、multiview で両目を1回で描画）
+    std::vector<VkCommandBuffer> cmdBuffers; // [imageIdx]
 };
 
 // ============================================================
@@ -184,13 +184,14 @@ static void CreateBuffer(VulkanCtx& vk, VkDeviceSize size,
 
 static void CreateImage(VulkanCtx& vk, uint32_t w, uint32_t h,
                         VkFormat format, VkImageUsageFlags usage,
-                        VkImage& image, VkDeviceMemory& memory) {
+                        VkImage& image, VkDeviceMemory& memory,
+                        uint32_t arrayLayers = 1) {
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType   = VK_IMAGE_TYPE_2D;
     ci.format      = format;
     ci.extent      = {w, h, 1};
     ci.mipLevels   = 1;
-    ci.arrayLayers = 1;
+    ci.arrayLayers = arrayLayers;
     ci.samples     = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling      = VK_IMAGE_TILING_OPTIMAL;
     ci.usage       = usage;
@@ -209,6 +210,17 @@ static void CreateImage(VulkanCtx& vk, uint32_t w, uint32_t h,
 }
 
 // ============================================================
+// 頂点フォーマット
+// fatVertex=false: vec3 のみ（12 bytes）
+// fatVertex=true : vec3 pos + vec3 normal + vec2 uv（32 bytes）
+// ============================================================
+struct FatVertex {
+    glm::vec3 pos;
+    glm::vec3 normal;
+    glm::vec2 uv;
+};
+
+// ============================================================
 // グリッドメッシュ生成
 // ============================================================
 static void GenerateGridMesh(VulkanCtx& vk, int N) {
@@ -217,14 +229,13 @@ static void GenerateGridMesh(VulkanCtx& vk, int N) {
     const int   iCount = (N - 1) * (N - 1) * 6;
     const float step   = 2.0f / (N - 1); // -1.0 〜 +1.0
 
-    std::vector<glm::vec3> verts(vCount);
+    std::vector<FatVertex> verts(vCount);
     for (int y = 0; y < N; y++) {
         for (int x = 0; x < N; x++) {
-            verts[y * N + x] = {
-                -1.0f + x * step,
-                -1.0f + y * step,
-                0.0f
-            };
+            FatVertex& v = verts[y * N + x];
+            v.pos    = { -1.0f + x * step, -1.0f + y * step, 0.0f };
+            v.normal = { 0.0f, 0.0f, 1.0f };
+            v.uv     = { (float)x / (N - 1), (float)y / (N - 1) };
         }
     }
 
@@ -249,7 +260,7 @@ static void GenerateGridMesh(VulkanCtx& vk, int N) {
          N, N, vCount, iCount, polyCount);
 
     // 頂点バッファ（HOST_VISIBLE で直接書き込み）
-    VkDeviceSize vSize = sizeof(glm::vec3) * vCount;
+    VkDeviceSize vSize = sizeof(FatVertex) * vCount;
     CreateBuffer(vk, vSize,
                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -280,6 +291,8 @@ struct App {
     VulkanCtx     vk;
     bool          initialized = false;
     int           gridN       = GRID_N; // Intent の "grid_n" で上書き可能
+    int           instCount   = 1;      // Intent の "inst_count" で上書き可能
+    int           aluIters    = 0;      // Intent の "alu_iters" で上書き可能
 
     // フレーム計測
     using Clock = std::chrono::high_resolution_clock;
@@ -386,6 +399,11 @@ static void CreateVulkanDevice(App& app) {
     }
     assert(app.vk.queueFamily != UINT32_MAX);
 
+    // maxPushConstantsSize を確認（multiview では mat4[2]+int = 132 バイト必要）
+    VkPhysicalDeviceProperties devProps;
+    vkGetPhysicalDeviceProperties(app.vk.physDevice, &devProps);
+    LOGI("maxPushConstantsSize=%u", devProps.limits.maxPushConstantsSize);
+
     // VkDevice 作成（xrCreateVulkanDeviceKHR 経由）
     float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -393,7 +411,13 @@ static void CreateVulkanDevice(App& app) {
     qci.queueCount       = 1;
     qci.pQueuePriorities = &priority;
 
+    // multiview feature を有効化
+    VkPhysicalDeviceMultiviewFeatures multiviewFeatures{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES};
+    multiviewFeatures.multiview = VK_TRUE;
+
     VkDeviceCreateInfo devCI{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    devCI.pNext                = &multiviewFeatures;
     devCI.queueCreateInfoCount = 1;
     devCI.pQueueCreateInfos    = &qci;
 
@@ -464,37 +488,36 @@ static void CreateSwapchains(App& app) {
     }
     LOGI("Swapchain color format: %lld", (long long)colorFmt);
 
-    app.xr.swapchains.resize(viewCount);
-    for (uint32_t eye = 0; eye < viewCount; eye++) {
-        EyeSwapchain& sc = app.xr.swapchains[eye];
-        sc.width  = vcViews[eye].recommendedImageRectWidth;
-        sc.height = vcViews[eye].recommendedImageRectHeight;
+    // multiview: 1つの swapchain（arraySize=2）で両目を扱う
+    app.xr.swapchains.resize(1);
+    EyeSwapchain& sc = app.xr.swapchains[0];
+    sc.width  = vcViews[0].recommendedImageRectWidth;
+    sc.height = vcViews[0].recommendedImageRectHeight;
 
-        XrSwapchainCreateInfo sci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-        sci.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
-                          XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-        sci.format      = colorFmt;
-        sci.sampleCount = 1;
-        sci.width       = sc.width;
-        sci.height      = sc.height;
-        sci.faceCount   = 1;
-        sci.arraySize   = 1;
-        sci.mipCount    = 1;
-        CHECK_XR(xrCreateSwapchain(app.xr.session, &sci, &sc.handle));
+    XrSwapchainCreateInfo sci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                      XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    sci.format      = colorFmt;
+    sci.sampleCount = 1;
+    sci.width       = sc.width;
+    sci.height      = sc.height;
+    sci.faceCount   = 1;
+    sci.arraySize   = 2;  // 両目分
+    sci.mipCount    = 1;
+    CHECK_XR(xrCreateSwapchain(app.xr.session, &sci, &sc.handle));
 
-        uint32_t imgCount = 0;
-        CHECK_XR(xrEnumerateSwapchainImages(sc.handle, 0, &imgCount, nullptr));
-        std::vector<XrSwapchainImageVulkanKHR> xrImages(imgCount,
-            {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
-        CHECK_XR(xrEnumerateSwapchainImages(sc.handle, imgCount, &imgCount,
-            (XrSwapchainImageBaseHeader*)xrImages.data()));
+    uint32_t imgCount = 0;
+    CHECK_XR(xrEnumerateSwapchainImages(sc.handle, 0, &imgCount, nullptr));
+    std::vector<XrSwapchainImageVulkanKHR> xrImages(imgCount,
+        {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    CHECK_XR(xrEnumerateSwapchainImages(sc.handle, imgCount, &imgCount,
+        (XrSwapchainImageBaseHeader*)xrImages.data()));
 
-        sc.images.resize(imgCount);
-        for (uint32_t i = 0; i < imgCount; i++) {
-            sc.images[i].image = xrImages[i].image;
-        }
-        LOGI("Eye %d swapchain: %dx%d, %d images", eye, sc.width, sc.height, imgCount);
+    sc.images.resize(imgCount);
+    for (uint32_t i = 0; i < imgCount; i++) {
+        sc.images[i].image = xrImages[i].image;
     }
+    LOGI("Stereo swapchain: %dx%d arraySize=2, %d images", sc.width, sc.height, imgCount);
 }
 
 // ---- RenderPass 作成 ----
@@ -540,7 +563,18 @@ static void CreateRenderPass(App& app, VkFormat colorFormat) {
     dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
+    // multiview: viewMask=0b11 で左右目を同時描画
+    uint32_t viewMask        = 0b11u;
+    uint32_t correlationMask = 0b11u;
+    VkRenderPassMultiviewCreateInfo multiviewCI{
+        VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO};
+    multiviewCI.subpassCount         = 1;
+    multiviewCI.pViewMasks           = &viewMask;
+    multiviewCI.correlationMaskCount = 1;
+    multiviewCI.pCorrelationMasks    = &correlationMask;
+
     VkRenderPassCreateInfo rpCI{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpCI.pNext           = &multiviewCI;
     rpCI.attachmentCount = 2;
     rpCI.pAttachments    = attachments;
     rpCI.subpassCount    = 1;
@@ -575,9 +609,9 @@ static void CreatePipeline(App& app, uint32_t width, uint32_t height) {
     stages[1].module = fragMod;
     stages[1].pName  = "main";
 
-    // 頂点入力（vec3 position のみ）
-    VkVertexInputBindingDescription binding{0, sizeof(glm::vec3), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription attr{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0};
+    // 頂点入力（FatVertex: pos のみ使用、stride=32B でパディング分も含む）
+    VkVertexInputBindingDescription binding{0, sizeof(FatVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attr{0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(FatVertex, pos)};
 
     VkPipelineVertexInputStateCreateInfo viCI{
         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -625,8 +659,8 @@ static void CreatePipeline(App& app, uint32_t width, uint32_t height) {
     cbCI.attachmentCount = 1;
     cbCI.pAttachments    = &cbAtt;
 
-    // Push constants: mat4 mvp
-    VkPushConstantRange pcRange{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4)};
+    // Push constants: mat4 mvp[2] + int aluIters = 132 bytes（multiview）
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4) * 2 + sizeof(int32_t)};
     VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plCI.pushConstantRangeCount = 1;
     plCI.pPushConstantRanges    = &pcRange;
@@ -653,67 +687,63 @@ static void CreatePipeline(App& app, uint32_t width, uint32_t height) {
     LOGI("GraphicsPipeline created");
 }
 
-// ---- ImageView / Framebuffer / CommandBuffer を各目に作成 ----
+// ---- ImageView / Framebuffer / CommandBuffer を作成（multiview: 1 swapchain） ----
 static void CreateFrameResources(App& app, VkFormat colorFormat) {
-    const uint32_t eyeCount = (uint32_t)app.xr.swapchains.size();
-
     // コマンドプール
     VkCommandPoolCreateInfo cpCI{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpCI.queueFamilyIndex = app.vk.queueFamily;
     cpCI.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     CHECK_VK(vkCreateCommandPool(app.vk.device, &cpCI, nullptr, &app.vk.cmdPool));
 
-    app.vk.cmdBuffers.resize(eyeCount);
+    // multiview では swapchain は1つ（arraySize=2）
+    EyeSwapchain& sc = app.xr.swapchains[0];
+    uint32_t imgCount = (uint32_t)sc.images.size();
 
-    for (uint32_t eye = 0; eye < eyeCount; eye++) {
-        EyeSwapchain& sc = app.xr.swapchains[eye];
-        uint32_t imgCount = (uint32_t)sc.images.size();
+    // デプスバッファ（arrayLayers=2 で両目分）
+    CreateImage(app.vk, sc.width, sc.height,
+                VK_FORMAT_D24_UNORM_S8_UINT,
+                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                sc.depthImage, sc.depthMemory,
+                2 /* arrayLayers=2 */);
 
-        // デプスバッファ（各目に1つ）
-        CreateImage(app.vk, sc.width, sc.height,
-                    VK_FORMAT_D24_UNORM_S8_UINT,
-                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                    sc.depthImage, sc.depthMemory);
+    VkImageViewCreateInfo dvCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    dvCI.image    = sc.depthImage;
+    dvCI.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    dvCI.format   = VK_FORMAT_D24_UNORM_S8_UINT;
+    dvCI.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                             0, 1, 0, 2 /* layerCount=2 */};
+    CHECK_VK(vkCreateImageView(app.vk.device, &dvCI, nullptr, &sc.depthView));
 
-        VkImageViewCreateInfo dvCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        dvCI.image    = sc.depthImage;
-        dvCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        dvCI.format   = VK_FORMAT_D24_UNORM_S8_UINT;
-        dvCI.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
-                                 0, 1, 0, 1};
-        CHECK_VK(vkCreateImageView(app.vk.device, &dvCI, nullptr, &sc.depthView));
+    // 各スワップチェーン画像の ImageView + Framebuffer
+    for (uint32_t i = 0; i < imgCount; i++) {
+        SwapchainImage& si = sc.images[i];
 
-        // 各スワップチェーン画像の ImageView + Framebuffer
-        for (uint32_t i = 0; i < imgCount; i++) {
-            SwapchainImage& si = sc.images[i];
+        // color: 2D_ARRAY（arraySize=2 の swapchain image）
+        VkImageViewCreateInfo civCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        civCI.image    = si.image;
+        civCI.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        civCI.format   = colorFormat;
+        civCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2 /* layerCount=2 */};
+        CHECK_VK(vkCreateImageView(app.vk.device, &civCI, nullptr, &si.view));
 
-            VkImageViewCreateInfo civCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-            civCI.image    = si.image;
-            civCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            civCI.format   = colorFormat;
-            civCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            CHECK_VK(vkCreateImageView(app.vk.device, &civCI, nullptr, &si.view));
-
-            VkImageView fbAttachments[] = {si.view, sc.depthView};
-            VkFramebufferCreateInfo fbCI{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-            fbCI.renderPass      = app.vk.renderPass;
-            fbCI.attachmentCount = 2;
-            fbCI.pAttachments    = fbAttachments;
-            fbCI.width           = sc.width;
-            fbCI.height          = sc.height;
-            fbCI.layers          = 1;
-            CHECK_VK(vkCreateFramebuffer(app.vk.device, &fbCI, nullptr, &si.framebuffer));
-        }
-
-        // コマンドバッファ
-        app.vk.cmdBuffers[eye].resize(imgCount);
-        VkCommandBufferAllocateInfo cbAI{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cbAI.commandPool        = app.vk.cmdPool;
-        cbAI.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbAI.commandBufferCount = imgCount;
-        CHECK_VK(vkAllocateCommandBuffers(
-            app.vk.device, &cbAI, app.vk.cmdBuffers[eye].data()));
+        VkImageView fbAttachments[] = {si.view, sc.depthView};
+        VkFramebufferCreateInfo fbCI{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fbCI.renderPass      = app.vk.renderPass;
+        fbCI.attachmentCount = 2;
+        fbCI.pAttachments    = fbAttachments;
+        fbCI.width           = sc.width;
+        fbCI.height          = sc.height;
+        fbCI.layers          = 1; // multiview では layers=1
+        CHECK_VK(vkCreateFramebuffer(app.vk.device, &fbCI, nullptr, &si.framebuffer));
     }
+
+    // コマンドバッファ（imageIdx の1次元）
+    app.vk.cmdBuffers.resize(imgCount);
+    VkCommandBufferAllocateInfo cbAI{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbAI.commandPool        = app.vk.cmdPool;
+    cbAI.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbAI.commandBufferCount = imgCount;
+    CHECK_VK(vkAllocateCommandBuffers(app.vk.device, &cbAI, app.vk.cmdBuffers.data()));
 
     // フェンス
     VkFenceCreateInfo fCI{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -762,11 +792,34 @@ static void Initialize(App& app) {
          app.gridN, (app.gridN - 1) * (app.gridN - 1) * 2);
 }
 
-// ---- 1 eye を描画 ----
-static void RenderEye(App& app, uint32_t eye, uint32_t imageIdx,
-                      const XrView& view, uint32_t swapW, uint32_t swapH) {
-    VkCommandBuffer cmd = app.vk.cmdBuffers[eye][imageIdx];
-    VkFramebuffer   fb  = app.xr.swapchains[eye].images[imageIdx].framebuffer;
+// ---- XrView から MVP 行列を計算（view_mat 不使用：カメラ空間固定）----
+static glm::mat4 ComputeMVP(const XrView& view) {
+    const XrFovf& fov = view.fov;
+    float l = tanf(fov.angleLeft);
+    float r = tanf(fov.angleRight);
+    float d = tanf(fov.angleDown);
+    float u = tanf(fov.angleUp);
+    float zNear = 0.05f, zFar = 100.f;
+    glm::mat4 proj(0.f);
+    proj[0][0] = 2.f / (r - l);
+    proj[1][1] = 2.f / (u - d);
+    proj[2][0] = (r + l) / (r - l);
+    proj[2][1] = (u + d) / (u - d);
+    proj[2][2] = -(zFar + zNear) / (zFar - zNear);
+    proj[2][3] = -1.f;
+    proj[3][2] = -(2.f * zFar * zNear) / (zFar - zNear);
+
+    glm::mat4 model = glm::translate(glm::mat4(1.f), glm::vec3(0.f, 0.f, -3.f))
+                    * glm::scale(glm::mat4(1.f), glm::vec3(2.f, 2.f, 1.f));
+    return proj * model;
+}
+
+// ---- 両目をまとめて描画（multiview: 1 draw call で左右同時） ----
+static void RenderStereo(App& app, uint32_t imageIdx,
+                         const std::vector<XrView>& views,
+                         uint32_t swapW, uint32_t swapH) {
+    VkCommandBuffer cmd = app.vk.cmdBuffers[imageIdx];
+    VkFramebuffer   fb  = app.xr.swapchains[0].images[imageIdx].framebuffer;
 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -787,44 +840,20 @@ static void RenderEye(App& app, uint32_t eye, uint32_t imageIdx,
     vkCmdBeginRenderPass(cmd, &rpBI, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.pipeline);
 
-    // MVP 行列（XrView の pose/fov から生成）
-    const XrQuaternionf& q = view.pose.orientation;
-    const XrVector3f&    p = view.pose.position;
-
-    // ビュー行列（クォータニオンと位置から）
-    glm::mat4 rot = glm::mat4_cast(glm::quat(q.w, q.x, q.y, q.z));
-    glm::mat4 trans = glm::translate(glm::mat4(1.f), glm::vec3(p.x, p.y, p.z));
-    glm::mat4 view_mat = glm::inverse(trans * rot);
-
-    // プロジェクション行列（非対称錐台）
-    const XrFovf& fov = view.fov;
-    float l = tanf(fov.angleLeft);
-    float r = tanf(fov.angleRight);
-    float d = tanf(fov.angleDown);
-    float u = tanf(fov.angleUp);
-    float zNear = 0.05f, zFar = 100.f;
-    glm::mat4 proj(0.f);
-    proj[0][0] = 2.f / (r - l);
-    proj[1][1] = 2.f / (u - d);
-    proj[2][0] = (r + l) / (r - l);
-    proj[2][1] = (u + d) / (u - d);
-    proj[2][2] = -(zFar + zNear) / (zFar - zNear);
-    proj[2][3] = -1.f;
-    proj[3][2] = -(2.f * zFar * zNear) / (zFar - zNear);
-
-    // メッシュを正面 3m 先に配置
-    glm::mat4 model = glm::translate(glm::mat4(1.f), glm::vec3(0.f, 0.f, -3.f))
-                    * glm::scale(glm::mat4(1.f), glm::vec3(2.f, 2.f, 1.f));
-    glm::mat4 mvp = proj * view_mat * model;
-
+    // 両目の MVP を push constants に詰める
+    struct PushConst { glm::mat4 mvp[2]; int32_t aluIters; };
+    PushConst pc;
+    pc.mvp[0]   = ComputeMVP(views[0]);
+    pc.mvp[1]   = ComputeMVP(views[1]);
+    pc.aluIters = (int32_t)app.aluIters;
     vkCmdPushConstants(cmd, app.vk.pipelineLayout,
-                       VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4),
-                       glm::value_ptr(mvp));
+                       VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(PushConst), &pc);
 
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &app.vk.vertexBuffer, &offset);
     vkCmdBindIndexBuffer(cmd, app.vk.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, app.vk.indexCount, 1, 0, 0, 0);
+    // multiview: 1 draw call で gl_ViewIndex=0,1 両方が走る
+    vkCmdDrawIndexed(cmd, app.vk.indexCount, (uint32_t)app.instCount, 0, 0, 0);
 
     vkCmdEndRenderPass(cmd);
     CHECK_VK(vkEndCommandBuffer(cmd));
@@ -845,8 +874,8 @@ static void RenderFrame(App& app) {
     std::vector<XrCompositionLayerProjectionView> projViews;
 
     if (fst.shouldRender) {
-        // ビューのロケーション取得
-        uint32_t viewCount = (uint32_t)app.xr.swapchains.size();
+        // ビューのロケーション取得（PRIMARY_STEREO は常に2ビュー）
+        uint32_t viewCount = 2;
         std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
         XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
         vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -858,50 +887,44 @@ static void RenderFrame(App& app) {
 
         projViews.resize(viewCount);
 
-        // 全目のコマンドバッファを記録してから一括サブミット
-        std::vector<VkCommandBuffer> submitCmds;
+        // multiview: 1つの swapchain から画像を取得して両目を1 draw call で描画
+        EyeSwapchain& sc = app.xr.swapchains[0];
 
+        XrSwapchainImageAcquireInfo acqInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        uint32_t imgIdx = 0;
+        CHECK_XR(xrAcquireSwapchainImage(sc.handle, &acqInfo, &imgIdx));
+
+        XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        waitInfo.timeout = XR_INFINITE_DURATION;
+        CHECK_XR(xrWaitSwapchainImage(sc.handle, &waitInfo));
+
+        // 両目まとめて描画
+        RenderStereo(app, imgIdx, views, sc.width, sc.height);
+
+        // ProjectionView を設定（左右眼それぞれ、arrayIndex で layer を指定）
         for (uint32_t eye = 0; eye < viewCount; eye++) {
-            EyeSwapchain& sc = app.xr.swapchains[eye];
-
-            // スワップチェーン画像を取得
-            XrSwapchainImageAcquireInfo acqInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-            uint32_t imgIdx = 0;
-            CHECK_XR(xrAcquireSwapchainImage(sc.handle, &acqInfo, &imgIdx));
-
-            XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-            waitInfo.timeout = XR_INFINITE_DURATION;
-            CHECK_XR(xrWaitSwapchainImage(sc.handle, &waitInfo));
-
-            // 描画
-            RenderEye(app, eye, imgIdx, views[eye], sc.width, sc.height);
-            submitCmds.push_back(app.vk.cmdBuffers[eye][imgIdx]);
-
-            // ProjectionView を設定
             projViews[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-            projViews[eye].pose    = views[eye].pose;
-            projViews[eye].fov     = views[eye].fov;
+            projViews[eye].pose = views[eye].pose;
+            projViews[eye].fov  = views[eye].fov;
             projViews[eye].subImage.swapchain             = sc.handle;
             projViews[eye].subImage.imageRect.offset      = {0, 0};
             projViews[eye].subImage.imageRect.extent      = {(int32_t)sc.width, (int32_t)sc.height};
-            projViews[eye].subImage.imageArrayIndex       = 0;
+            projViews[eye].subImage.imageArrayIndex       = eye; // 0=左, 1=右
         }
 
         // フェンス待機 & リセット
         vkWaitForFences(app.vk.device, 1, &app.vk.fence, VK_TRUE, UINT64_MAX);
         vkResetFences(app.vk.device, 1, &app.vk.fence);
 
-        // キューサブミット
+        // キューサブミット（コマンドバッファ1つ）
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = (uint32_t)submitCmds.size();
-        si.pCommandBuffers    = submitCmds.data();
+        si.commandBufferCount = 1;
+        si.pCommandBuffers    = &app.vk.cmdBuffers[imgIdx];
         CHECK_VK(vkQueueSubmit(app.vk.queue, 1, &si, app.vk.fence));
 
         // スワップチェーン画像を解放
-        for (uint32_t eye = 0; eye < viewCount; eye++) {
-            XrSwapchainImageReleaseInfo relInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            CHECK_XR(xrReleaseSwapchainImage(app.xr.swapchains[eye].handle, &relInfo));
-        }
+        XrSwapchainImageReleaseInfo relInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        CHECK_XR(xrReleaseSwapchainImage(sc.handle, &relInfo));
 
         projLayer.space                = app.xr.appSpace;
         projLayer.viewCount            = viewCount;
@@ -925,11 +948,17 @@ static void RenderFrame(App& app) {
     // 毎秒ログ出力
     double elapsed = std::chrono::duration<double>(t1 - app.lastLogTime).count();
     if (elapsed >= 1.0) {
-        double avgMs = app.frameMsAccum / app.frameCount;
-        double fps   = app.frameCount / elapsed;
-        int    polys = (app.gridN - 1) * (app.gridN - 1) * 2;
-        LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  Polygons=%d  Vertices=%d",
-             fps, avgMs, polys, (int)app.vk.vertexCount);
+        double avgMs    = app.frameMsAccum / app.frameCount;
+        double fps      = app.frameCount / elapsed;
+        int    polysInst = (app.gridN - 1) * (app.gridN - 1) * 2;
+        int    polysTotal = polysInst * app.instCount;
+        if (app.instCount > 1) {
+            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  Polygons=%d  (inst=%d x %d poly)",
+                 fps, avgMs, polysTotal, app.instCount, polysInst);
+        } else {
+            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  Polygons=%d  Vertices=%d",
+                 fps, avgMs, polysTotal, (int)app.vk.vertexCount);
+        }
         app.frameMsAccum = 0.0;
         app.frameCount   = 0;
         app.lastLogTime  = t1;
@@ -1025,39 +1054,53 @@ static void Cleanup(App& app) {
 }
 
 // ============================================================
-// Intent エクストラから grid_n を取得する
+// Intent エクストラからパラメータを取得する
 // 使い方:
 //   adb shell am start -n com.example.picoperftest/android.app.NativeActivity \
-//       --ei grid_n 2237
+//       --ei grid_n 1584
+//   adb shell am start -n com.example.picoperftest/android.app.NativeActivity \
+//       --ei grid_n 17 --ei inst_count 10000
 // ============================================================
-static int GetGridNFromIntent(android_app* aApp, int defaultVal) {
+static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount, int& outAluIters) {
     JNIEnv* env = nullptr;
     aApp->activity->vm->AttachCurrentThread(&env, nullptr);
 
-    jobject activity    = aApp->activity->clazz;
-    jclass  actClass    = env->GetObjectClass(activity);
+    jobject activity   = aApp->activity->clazz;
+    jclass  actClass   = env->GetObjectClass(activity);
 
-    // activity.getIntent()
-    jmethodID getIntent = env->GetMethodID(actClass, "getIntent", "()Landroid/content/Intent;");
-    jobject   intent    = env->CallObjectMethod(activity, getIntent);
+    jmethodID getIntent   = env->GetMethodID(actClass, "getIntent", "()Landroid/content/Intent;");
+    jobject   intent      = env->CallObjectMethod(activity, getIntent);
+    jclass    intentClass = env->GetObjectClass(intent);
+    jmethodID getIntExtra = env->GetMethodID(intentClass, "getIntExtra",
+                                             "(Ljava/lang/String;I)I");
 
-    // intent.getIntExtra("grid_n", defaultVal)
-    jclass    intentClass  = env->GetObjectClass(intent);
-    jmethodID getIntExtra  = env->GetMethodID(intentClass, "getIntExtra",
-                                              "(Ljava/lang/String;I)I");
-    jstring   key          = env->NewStringUTF("grid_n");
-    jint      result       = env->CallIntMethod(intent, getIntExtra, key, (jint)defaultVal);
+    jstring keyGridN = env->NewStringUTF("grid_n");
+    jint    gridN    = env->CallIntMethod(intent, getIntExtra, keyGridN, (jint)outGridN);
+    env->DeleteLocalRef(keyGridN);
 
-    env->DeleteLocalRef(key);
+    jstring keyInst  = env->NewStringUTF("inst_count");
+    jint    instCount = env->CallIntMethod(intent, getIntExtra, keyInst, (jint)outInstCount);
+    env->DeleteLocalRef(keyInst);
+
+    jstring keyAlu   = env->NewStringUTF("alu_iters");
+    jint    aluIters = env->CallIntMethod(intent, getIntExtra, keyAlu, (jint)outAluIters);
+    env->DeleteLocalRef(keyAlu);
+
     env->DeleteLocalRef(intent);
     env->DeleteLocalRef(actClass);
     aApp->activity->vm->DetachCurrentThread();
 
-    if (result <= 1) {
-        LOGW("grid_n=%d is too small, using default %d", (int)result, defaultVal);
-        return defaultVal;
+    if (gridN <= 1) {
+        LOGW("grid_n=%d is too small, using default %d", (int)gridN, outGridN);
+    } else {
+        outGridN = (int)gridN;
     }
-    return (int)result;
+    if (instCount < 1) {
+        LOGW("inst_count=%d is invalid, using default %d", (int)instCount, outInstCount);
+    } else {
+        outInstCount = (int)instCount;
+    }
+    if (aluIters >= 0) outAluIters = (int)aluIters;
 }
 
 // ============================================================
@@ -1084,9 +1127,11 @@ void android_main(android_app* aApp) {
 
     if (aApp->destroyRequested) return;
 
-    // Intent の "grid_n" エクストラを読んでポリゴン数を設定
-    app.gridN = GetGridNFromIntent(aApp, app.gridN);
-    LOGI("grid_n = %d  (polygons ≈ %d)", app.gridN, (app.gridN - 1) * (app.gridN - 1) * 2);
+    // Intent エクストラを読んでパラメータを設定
+    GetIntentParams(aApp, app.gridN, app.instCount, app.aluIters);
+    int polysPerInst = (app.gridN - 1) * (app.gridN - 1) * 2;
+    LOGI("grid_n=%d  inst_count=%d  alu_iters=%d  polygons≈%d (total≈%d)",
+         app.gridN, app.instCount, app.aluIters, polysPerInst, polysPerInst * app.instCount);
 
     // OpenXR ローダーおよびランタイムへの接続に JNI スレッドのアタッチが必要。
     // PICO SDK フレームワーク (BasicOpenXrWrapper) は xrInitializeLoaderKHR の前に
