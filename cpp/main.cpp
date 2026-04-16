@@ -251,11 +251,11 @@ struct Meshlet {
 static_assert(sizeof(Meshlet) == 48, "Meshlet struct must be 48 bytes (std430)");
 
 // ============================================================
-// 立方体メッシュ生成（6面それぞれに N×N グリッド、meshlet 分割）
+// 複数立方体メッシュ生成（world 空間に 3D 格子配置、meshlet 分割）
 // ============================================================
 static constexpr int MESHLET_TILE = 16; // 16×16 quads/meshlet = 512 tris
 
-static void GenerateCubeMesh(VulkanCtx& vk, int N) {
+static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
     // 立方体の6面（origin=左下頂点、du=横方向、dv=縦方向、反時計回りで外向き法線）
     struct Face { glm::vec3 origin, du, dv; };
     const Face faces[6] = {
@@ -273,79 +273,113 @@ static void GenerateCubeMesh(VulkanCtx& vk, int N) {
     const int vPerFace     = Nfit * Nfit;
     const int iPerMeshlet  = MESHLET_TILE * MESHLET_TILE * 6;
     const int mPerFace     = tiles * tiles;
-    const int totalVerts    = vPerFace * 6;
-    const int totalIdx      = iPerMeshlet * mPerFace * 6;
-    const int totalMeshlets = mPerFace * 6;
+    const int vPerCube     = vPerFace * 6;
+    const int iPerCube     = iPerMeshlet * mPerFace * 6;
+    const int mPerCube     = mPerFace * 6;
+    const int totalVerts    = vPerCube * cubeCount;
+    const int totalIdx      = iPerCube * cubeCount;
+    const int totalMeshlets = mPerCube * cubeCount;
 
     std::vector<FatVertex> verts(totalVerts);
     std::vector<uint32_t>  indices(totalIdx);
     std::vector<Meshlet>   meshlets(totalMeshlets);
 
-    for (int f = 0; f < 6; f++) {
-        const Face& face   = faces[f];
-        // 外向き法線: du,dv の定義上 cross(dv, du) が正しい向きになる
-        const glm::vec3 fN = glm::normalize(glm::cross(face.dv, face.du));
-        const int   vBase = f * vPerFace;
-        const int   iBase = f * iPerMeshlet * mPerFace;
-        const int   mBase = f * mPerFace;
-
-        // 頂点
-        for (int y = 0; y < Nfit; y++) {
-            for (int x = 0; x < Nfit; x++) {
-                float u = (float)x / (Nfit - 1);
-                float v = (float)y / (Nfit - 1);
-                FatVertex& vv = verts[vBase + y * Nfit + x];
-                vv.pos    = face.origin + u * face.du + v * face.dv;
-                vv.normal = fN;
-                vv.uv     = { u, v };
+    // 3D 格子配置（できるだけ cubeCount に近い分解を探索）
+    int GX = cubeCount, GY = 1, GZ = 1;
+    int bestDiff = cubeCount;
+    for (int gz = 1; gz * gz * gz <= cubeCount; gz++) {
+        for (int gy = gz; gy * gz <= cubeCount; gy++) {
+            int gx = (cubeCount + gy * gz - 1) / (gy * gz);
+            if (gx >= gy && gx * gy * gz >= cubeCount) {
+                int diff = gx - gz;
+                if (diff < bestDiff) {
+                    bestDiff = diff;
+                    GX = gx; GY = gy; GZ = gz;
+                }
             }
         }
+    }
+    const float spacing  = 0.6f;
+    const float cubeSize = 0.25f;
 
-        // meshlet順にインデックスとAABB
-        int iOff = iBase;
-        for (int my = 0; my < tiles; my++) {
-            for (int mx = 0; mx < tiles; mx++) {
-                uint32_t offsetStart = (uint32_t)iOff;
-                for (int ty = 0; ty < MESHLET_TILE; ty++) {
-                    for (int tx = 0; tx < MESHLET_TILE; tx++) {
-                        int xi = mx * MESHLET_TILE + tx;
-                        int yi = my * MESHLET_TILE + ty;
-                        uint32_t tl = (uint32_t)(vBase + yi * Nfit + xi);
-                        uint32_t tr = tl + 1;
-                        uint32_t bl = tl + Nfit;
-                        uint32_t br = bl + 1;
-                        indices[iOff++] = tl; indices[iOff++] = bl; indices[iOff++] = tr;
-                        indices[iOff++] = tr; indices[iOff++] = bl; indices[iOff++] = br;
-                    }
+    for (int c = 0; c < cubeCount; c++) {
+        int gx = c % GX;
+        int gy = (c / GX) % GY;
+        int gz = c / (GX * GY);
+
+        glm::vec3 center(
+            (gx - (GX - 1) * 0.5f) * spacing,
+            (gy - (GY - 1) * 0.5f) * spacing,
+            -3.0f - (gz - (GZ - 1) * 0.5f) * spacing);
+
+        const int vBaseC = c * vPerCube;
+        const int iBaseC = c * iPerCube;
+        const int mBaseC = c * mPerCube;
+
+        for (int f = 0; f < 6; f++) {
+            const Face& face   = faces[f];
+            const glm::vec3 fN = glm::normalize(glm::cross(face.dv, face.du));
+            const int   vBase = vBaseC + f * vPerFace;
+            const int   iBase = iBaseC + f * iPerMeshlet * mPerFace;
+            const int   mBase = mBaseC + f * mPerFace;
+
+            for (int y = 0; y < Nfit; y++) {
+                for (int x = 0; x < Nfit; x++) {
+                    float u = (float)x / (Nfit - 1);
+                    float v = (float)y / (Nfit - 1);
+                    glm::vec3 localPos = face.origin + u * face.du + v * face.dv;
+                    FatVertex& vv = verts[vBase + y * Nfit + x];
+                    vv.pos    = center + localPos * cubeSize;
+                    vv.normal = fN;
+                    vv.uv     = { u, v };
                 }
-                // meshlet AABB（モデル空間）
-                glm::vec3 pMin( 1e9f);
-                glm::vec3 pMax(-1e9f);
-                for (int ty = 0; ty <= MESHLET_TILE; ty++) {
-                    for (int tx = 0; tx <= MESHLET_TILE; tx++) {
-                        int xi = mx * MESHLET_TILE + tx;
-                        int yi = my * MESHLET_TILE + ty;
-                        float u = (float)xi / (Nfit - 1);
-                        float v = (float)yi / (Nfit - 1);
-                        glm::vec3 p = face.origin + u * face.du + v * face.dv;
-                        pMin = glm::min(pMin, p);
-                        pMax = glm::max(pMax, p);
+            }
+
+            int iOff = iBase;
+            for (int my = 0; my < tiles; my++) {
+                for (int mx = 0; mx < tiles; mx++) {
+                    uint32_t offsetStart = (uint32_t)iOff;
+                    for (int ty = 0; ty < MESHLET_TILE; ty++) {
+                        for (int tx = 0; tx < MESHLET_TILE; tx++) {
+                            int xi = mx * MESHLET_TILE + tx;
+                            int yi = my * MESHLET_TILE + ty;
+                            uint32_t tl = (uint32_t)(vBase + yi * Nfit + xi);
+                            uint32_t tr = tl + 1;
+                            uint32_t bl = tl + Nfit;
+                            uint32_t br = bl + 1;
+                            indices[iOff++] = tl; indices[iOff++] = bl; indices[iOff++] = tr;
+                            indices[iOff++] = tr; indices[iOff++] = bl; indices[iOff++] = br;
+                        }
                     }
-                }
-                // 退化軸を膨らませる
-                for (int i = 0; i < 3; i++) {
-                    if (pMax[i] - pMin[i] < 1e-4f) {
-                        pMin[i] -= 0.001f;
-                        pMax[i] += 0.001f;
+                    // meshlet AABB（world 空間）
+                    glm::vec3 pMin( 1e9f);
+                    glm::vec3 pMax(-1e9f);
+                    for (int ty = 0; ty <= MESHLET_TILE; ty++) {
+                        for (int tx = 0; tx <= MESHLET_TILE; tx++) {
+                            int xi = mx * MESHLET_TILE + tx;
+                            int yi = my * MESHLET_TILE + ty;
+                            float u = (float)xi / (Nfit - 1);
+                            float v = (float)yi / (Nfit - 1);
+                            glm::vec3 localPos = face.origin + u * face.du + v * face.dv;
+                            glm::vec3 p = center + localPos * cubeSize;
+                            pMin = glm::min(pMin, p);
+                            pMax = glm::max(pMax, p);
+                        }
                     }
+                    for (int i = 0; i < 3; i++) {
+                        if (pMax[i] - pMin[i] < 1e-4f) {
+                            pMin[i] -= 0.001f;
+                            pMax[i] += 0.001f;
+                        }
+                    }
+                    Meshlet& m = meshlets[mBase + my * tiles + mx];
+                    m.aabbMin     = pMin;
+                    m.aabbMax     = pMax;
+                    m.indexOffset = offsetStart;
+                    m.indexCount  = (uint32_t)iPerMeshlet;
+                    m.normal      = fN;
+                    m._pad        = 0;
                 }
-                Meshlet& m = meshlets[mBase + my * tiles + mx];
-                m.aabbMin     = pMin;
-                m.aabbMax     = pMax;
-                m.indexOffset = offsetStart;
-                m.indexCount  = (uint32_t)iPerMeshlet;
-                m.normal      = fN;
-                m._pad        = 0;
             }
         }
     }
@@ -355,8 +389,8 @@ static void GenerateCubeMesh(VulkanCtx& vk, int N) {
     vk.indexCount  = (uint32_t)totalIdx;
 
     int polyCount = totalMeshlets * MESHLET_TILE * MESHLET_TILE * 2;
-    LOGI("Cube mesh: %d verts, %d idx, %d polys, %d meshlets (6 faces x %dx%d)",
-         totalVerts, totalIdx, polyCount, totalMeshlets, tiles, tiles);
+    LOGI("Multi-cube mesh: %d cubes (%dx%dx%d), %d verts, %d idx, %d polys, %d meshlets",
+         cubeCount, GX, GY, GZ, totalVerts, totalIdx, polyCount, totalMeshlets);
 
     // 頂点バッファ（HOST_VISIBLE で直接書き込み）
     VkDeviceSize vSize = sizeof(FatVertex) * totalVerts;
@@ -420,6 +454,7 @@ struct App {
     int           instCount   = 1;      // Intent の "inst_count" で上書き可能
     int           aluIters    = 0;      // Intent の "alu_iters" で上書き可能
     int           cullEnabled = 1;      // Intent の "cull" で上書き可能（0=無効）
+    int           cubeCount   = 60;     // Intent の "num_cubes" で上書き可能
     uint32_t      lastVisibleCount = 0; // 前フレームの可視 meshlet 数（ログ用）
 
     // フレーム計測
@@ -1020,19 +1055,19 @@ static void Initialize(App& app) {
     uint32_t h = app.xr.swapchains[0].height;
     CreatePipeline(app, w, h);
     CreateFrameResources(app, colorFormat);
-    GenerateCubeMesh(app.vk, app.gridN);
+    GenerateMultiCubeMesh(app.vk, app.gridN, app.cubeCount);
     CreateComputePipeline(app);
 
     app.initialized = true;
     app.lastLogTime = App::Clock::now();
-    LOGI("=== Initialization complete. GRID_N=%d, meshlets=%u ===",
-         app.gridN, app.vk.meshletCount);
+    uint32_t computeGroups = (app.vk.meshletCount + 63) / 64;
+    LOGI("=== Initialization complete. GRID_N=%d cubes=%d meshlets=%u computeGroups=%u ===",
+         app.gridN, app.cubeCount, app.vk.meshletCount, computeGroups);
 }
 
-// 立方体のモデル行列（world 空間固定）
+// モデル行列（頂点は既に world 空間に配置済みなので identity）
 static glm::mat4 CubeModelMatrix() {
-    return glm::translate(glm::mat4(1.f), glm::vec3(0.f, 0.f, -3.f))
-         * glm::scale(glm::mat4(1.f), glm::vec3(1.5f, 1.5f, 1.5f));
+    return glm::mat4(1.f);
 }
 
 // ---- XrView から MVP 行列を計算 ----
@@ -1388,7 +1423,7 @@ static void Cleanup(App& app) {
 //   adb shell am start -n com.example.picoperftest/android.app.NativeActivity \
 //       --ei grid_n 17 --ei inst_count 10000
 // ============================================================
-static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount, int& outAluIters, int& outCull) {
+static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount, int& outAluIters, int& outCull, int& outCubeCount) {
     JNIEnv* env = nullptr;
     aApp->activity->vm->AttachCurrentThread(&env, nullptr);
 
@@ -1417,6 +1452,10 @@ static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount,
     jint    cull     = env->CallIntMethod(intent, getIntExtra, keyCull, (jint)outCull);
     env->DeleteLocalRef(keyCull);
 
+    jstring keyCubes = env->NewStringUTF("num_cubes");
+    jint    numCubes = env->CallIntMethod(intent, getIntExtra, keyCubes, (jint)outCubeCount);
+    env->DeleteLocalRef(keyCubes);
+
     env->DeleteLocalRef(intent);
     env->DeleteLocalRef(actClass);
     aApp->activity->vm->DetachCurrentThread();
@@ -1433,6 +1472,7 @@ static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount,
     }
     if (aluIters >= 0) outAluIters = (int)aluIters;
     if (cull == 0 || cull == 1) outCull = (int)cull;
+    if (numCubes >= 1) outCubeCount = (int)numCubes;
 }
 
 // ============================================================
@@ -1460,11 +1500,11 @@ void android_main(android_app* aApp) {
     if (aApp->destroyRequested) return;
 
     // Intent エクストラを読んでパラメータを設定
-    GetIntentParams(aApp, app.gridN, app.instCount, app.aluIters, app.cullEnabled);
-    int polysPerInst = (app.gridN - 1) * (app.gridN - 1) * 2;
-    LOGI("grid_n=%d  inst_count=%d  alu_iters=%d  cull=%d  polygons≈%d (total≈%d)",
-         app.gridN, app.instCount, app.aluIters, app.cullEnabled,
-         polysPerInst, polysPerInst * app.instCount);
+    // num_cubes>1 の検証用途ではデフォルト GRID_N を小さくする（未指定時の保険）
+    app.gridN = 97;
+    GetIntentParams(aApp, app.gridN, app.instCount, app.aluIters, app.cullEnabled, app.cubeCount);
+    LOGI("grid_n=%d  num_cubes=%d  inst_count=%d  alu_iters=%d  cull=%d",
+         app.gridN, app.cubeCount, app.instCount, app.aluIters, app.cullEnabled);
 
     // OpenXR ローダーおよびランタイムへの接続に JNI スレッドのアタッチが必要。
     // PICO SDK フレームワーク (BasicOpenXrWrapper) は xrInitializeLoaderKHR の前に
