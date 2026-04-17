@@ -66,6 +66,7 @@ embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/pre_skin.comp"    pre_skin_spv
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/vertex_vs_skin.vert" vertex_vs_skin_spv)
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/skin_cull.comp"    skin_cull_spv)
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/skin_cull_lds.comp" skin_cull_lds_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/skin_cull_lds_u16.comp" skin_cull_lds_u16_spv)
 
 # ---- android_native_app_glue（静的ライブラリ）----
 add_library(app_glue STATIC
@@ -87,6 +88,7 @@ add_library(PICOPerformanceTest MODULE
     "${SHADER_GEN_DIR}/vertex_vs_skin_spv.h"
     "${SHADER_GEN_DIR}/skin_cull_spv.h"
     "${SHADER_GEN_DIR}/skin_cull_lds_spv.h"
+    "${SHADER_GEN_DIR}/skin_cull_lds_u16_spv.h"
 )
 
 target_include_directories(PICOPerformanceTest PRIVATE

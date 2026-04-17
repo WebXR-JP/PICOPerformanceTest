@@ -42,6 +42,7 @@
 #include "vertex_vs_skin_spv.h"
 #include "skin_cull_spv.h"
 #include "skin_cull_lds_spv.h"
+#include "skin_cull_lds_u16_spv.h"
 
 // ---- ログマクロ ----
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "PICOPerfTest", __VA_ARGS__)
@@ -174,7 +175,7 @@ struct VulkanCtx {
     VkDescriptorPool      gfxDescPool            = VK_NULL_HANDLE;
     VkDescriptorSet       gfxDescSet             = VK_NULL_HANDLE;
 
-    // ---- uint16 Index (mode=4: per-cube 16-bit, no culling) ----
+    // ---- uint16 Index (mode=4: draw-pass only compare, per-cube 16-bit, no culling) ----
     VkBuffer              indexBufferU16         = VK_NULL_HANDLE;
     VkDeviceMemory        indexMemoryU16         = VK_NULL_HANDLE;
     VkBuffer              prebuiltDrawCmdBuffer  = VK_NULL_HANDLE;
@@ -182,6 +183,17 @@ struct VulkanCtx {
     int                   vertsPerCube           = 0;
     int                   indicesPerCube         = 0;
     int                   cubeCountStored        = 0;
+
+    // ---- mode=8: CS LDS skin+cull + per-cube u16 compact index ----
+    VkBuffer              compactIndexBufferU16     = VK_NULL_HANDLE;
+    VkDeviceMemory        compactIndexMemoryU16     = VK_NULL_HANDLE;
+    VkBuffer              bfDrawCmdBufferU16        = VK_NULL_HANDLE;
+    VkDeviceMemory        bfDrawCmdMemoryU16        = VK_NULL_HANDLE;
+    VkDescriptorSetLayout skinCullLdsU16DescLayout    = VK_NULL_HANDLE;
+    VkDescriptorPool      skinCullLdsU16DescPool      = VK_NULL_HANDLE;
+    VkDescriptorSet       skinCullLdsU16DescSet       = VK_NULL_HANDLE;
+    VkPipelineLayout      skinCullLdsU16PipelineLayout = VK_NULL_HANDLE;
+    VkPipeline            skinCullLdsU16Pipeline      = VK_NULL_HANDLE;
 
     // ---- mode=5: VS-inline skinning（CS posF16 書き出しなし）----
     VkDescriptorSetLayout vsSkinDescLayout      = VK_NULL_HANDLE;
@@ -285,6 +297,44 @@ static void CreateBuffer(VulkanCtx& vk, VkDeviceSize size,
     ai.memoryTypeIndex = FindMemoryType(vk.physDevice, req.memoryTypeBits, memProps);
     CHECK_VK(vkAllocateMemory(vk.device, &ai, nullptr, &memory));
     CHECK_VK(vkBindBufferMemory(vk.device, buffer, memory, 0));
+}
+
+static void UploadBufferData(VulkanCtx& vk, VkBuffer dstBuffer, const void* srcData, VkDeviceSize size) {
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    CreateBuffer(vk, size,
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 stagingBuffer, stagingMemory);
+
+    void* mapped = nullptr;
+    CHECK_VK(vkMapMemory(vk.device, stagingMemory, 0, size, 0, &mapped));
+    memcpy(mapped, srcData, (size_t)size);
+    vkUnmapMemory(vk.device, stagingMemory);
+
+    VkCommandBufferAllocateInfo cbAI{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbAI.commandPool = vk.cmdPool;
+    cbAI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbAI.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    CHECK_VK(vkAllocateCommandBuffers(vk.device, &cbAI, &cmd));
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    CHECK_VK(vkBeginCommandBuffer(cmd, &bi));
+    VkBufferCopy region{0, 0, size};
+    vkCmdCopyBuffer(cmd, stagingBuffer, dstBuffer, 1, &region);
+    CHECK_VK(vkEndCommandBuffer(cmd));
+
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    CHECK_VK(vkQueueSubmit(vk.queue, 1, &si, VK_NULL_HANDLE));
+    CHECK_VK(vkQueueWaitIdle(vk.queue));
+
+    vkFreeCommandBuffers(vk.device, vk.cmdPool, 1, &cmd);
+    vkDestroyBuffer(vk.device, stagingBuffer, nullptr);
+    vkFreeMemory(vk.device, stagingMemory, nullptr);
 }
 
 static void CreateImage(VulkanCtx& vk, uint32_t w, uint32_t h,
@@ -560,38 +610,34 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
     LOGI("Multi-cube mesh: %d cubes (%dx%dx%d), %d verts, %d idx, %d polys, %d meshlets",
          cubeCount, GX, GY, GZ, totalVerts, totalIdx, polyCount, totalMeshlets);
 
-    // 頂点バッファ（HOST_VISIBLE で直接書き込み、CS 読み取り用に STORAGE も追加）
+    // 頂点バッファ（初期化時に staging upload して DEVICE_LOCAL 化）
     VkDeviceSize vSize = sizeof(FatVertex) * totalVerts;
     CreateBuffer(vk, vSize,
-                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                  vk.vertexBuffer, vk.vertexMemory);
-    void* vPtr;
-    vkMapMemory(vk.device, vk.vertexMemory, 0, vSize, 0, &vPtr);
-    memcpy(vPtr, verts.data(), vSize);
-    vkUnmapMemory(vk.device, vk.vertexMemory);
+    UploadBufferData(vk, vk.vertexBuffer, verts.data(), vSize);
 
-    // インデックスバッファ（backface CS が読む）
+    // インデックスバッファ（backface CS が読む、staging upload 後は DEVICE_LOCAL）
     VkDeviceSize iSize = sizeof(uint32_t) * totalIdx;
     CreateBuffer(vk, iSize,
-                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                  vk.indexBuffer, vk.indexMemory);
-    void* iPtr;
-    vkMapMemory(vk.device, vk.indexMemory, 0, iSize, 0, &iPtr);
-    memcpy(iPtr, indices.data(), iSize);
-    vkUnmapMemory(vk.device, vk.indexMemory);
+    UploadBufferData(vk, vk.indexBuffer, indices.data(), iSize);
 
-    // ---- Meshlet SSBO（CPU -> GPU、read-only in compute）----
+    // ---- Meshlet SSBO（初期化時に staging upload して DEVICE_LOCAL 化）----
     VkDeviceSize mSize = sizeof(Meshlet) * totalMeshlets;
     CreateBuffer(vk, mSize,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                  vk.meshletBuffer, vk.meshletMemory);
-    void* mPtr;
-    vkMapMemory(vk.device, vk.meshletMemory, 0, mSize, 0, &mPtr);
-    memcpy(mPtr, meshlets.data(), mSize);
-    vkUnmapMemory(vk.device, vk.meshletMemory);
+    UploadBufferData(vk, vk.meshletBuffer, meshlets.data(), mSize);
 
     // ---- Indirect buffer（compute が書く、draw が読む）----
     VkDeviceSize drawCmdStride = 5 * sizeof(uint32_t); // VkDrawIndexedIndirectCommand = 20 bytes
@@ -609,20 +655,20 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  vk.visibleCountBuffer, vk.visibleCountMemory);
 
-    // ---- F16 位置バッファ（backface CS 専用）----
+    // ---- F16 位置バッファ（backface CS 専用、初期化時は staging upload）----
     // 各頂点を uvec2（8 bytes）に: .x = fp16(px)|fp16(py)<<16, .y = fp16(pz)
     {
         VkDeviceSize f16Size = (VkDeviceSize)totalVerts * 2 * sizeof(uint32_t);
         CreateBuffer(vk, f16Size,
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                      vk.posF16Buffer, vk.posF16Memory);
-        uint32_t* dst = nullptr;
-        vkMapMemory(vk.device, vk.posF16Memory, 0, f16Size, 0, (void**)&dst);
+        std::vector<uint32_t> packedPos((size_t)totalVerts * 2u);
         for (int i = 0; i < totalVerts; i++) {
-            PackPosF16(glm::vec3(verts[i].pos), dst + i * 2);
+            PackPosF16(glm::vec3(verts[i].pos), packedPos.data() + i * 2);
         }
-        vkUnmapMemory(vk.device, vk.posF16Memory);
+        UploadBufferData(vk, vk.posF16Buffer, packedPos.data(), f16Size);
     }
 
     // ---- Per-triangle backface culling 用バッファ ----
@@ -634,6 +680,11 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                  vk.compactIndexBuffer, vk.compactIndexMemory);
 
+    CreateBuffer(vk, sizeof(uint16_t) * (size_t)totalIdx,
+                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 vk.compactIndexBufferU16, vk.compactIndexMemoryU16);
+
     // 単一の DrawCmd（indexCount は CS が atomicAdd で書く、他は固定）
     VkDeviceSize drawCmdSize = 5 * sizeof(uint32_t);
     CreateBuffer(vk, drawCmdSize,
@@ -643,7 +694,14 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  vk.bfDrawCmdBuffer, vk.bfDrawCmdMemory);
 
-    // ---- uint16 per-cube index buffer + pre-built DrawCmd (mode=4) ----
+    CreateBuffer(vk, drawCmdSize * (size_t)cubeCount,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                 vk.bfDrawCmdBufferU16, vk.bfDrawCmdMemoryU16);
+
+    // ---- uint16 per-cube index buffer + pre-built DrawCmd (mode=4: draw-pass only compare) ----
     // vPerCube=56454 < 65535 なのでキューブ単位に分割すれば uint16 が使える
     vk.vertsPerCube    = vPerCube;
     vk.indicesPerCube  = iPerCube;
@@ -660,13 +718,11 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
         }
         VkDeviceSize iSizeU16 = sizeof(uint16_t) * (size_t)totalIdx;
         CreateBuffer(vk, iSizeU16,
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                      vk.indexBufferU16, vk.indexMemoryU16);
-        void* p;
-        vkMapMemory(vk.device, vk.indexMemoryU16, 0, iSizeU16, 0, &p);
-        memcpy(p, indicesU16.data(), iSizeU16);
-        vkUnmapMemory(vk.device, vk.indexMemoryU16);
+        UploadBufferData(vk, vk.indexBufferU16, indicesU16.data(), iSizeU16);
     }
 
     {
@@ -683,13 +739,11 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
         }
         VkDeviceSize pbSize = sizeof(PrebuiltCmd) * (size_t)cubeCount;
         CreateBuffer(vk, pbSize,
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                      vk.prebuiltDrawCmdBuffer, vk.prebuiltDrawCmdMemory);
-        void* p;
-        vkMapMemory(vk.device, vk.prebuiltDrawCmdMemory, 0, pbSize, 0, &p);
-        memcpy(p, cmds.data(), pbSize);
-        vkUnmapMemory(vk.device, vk.prebuiltDrawCmdMemory);
+        UploadBufferData(vk, vk.prebuiltDrawCmdBuffer, cmds.data(), pbSize);
     }
 
     // ---- Bone buffer (60 cubes × 8 bones = 480 bones)、mat4 fp16（16要素/骨、列優先）、CPU が毎フレーム更新 ----
@@ -727,7 +781,8 @@ struct App {
     int           aluIters    = 0;      // Intent の "alu_iters" で上書き可能
     int           cullEnabled = 1;      // Intent の "cull" で上書き可能（0=無効）
     // cullMode: 0=off, 1=meshlet culling, 2=per-triangle backface cull,
-    //           3=hybrid, 4=u16, 5=VS-inline skin, 6=CS fused skin+cull, 7=CS LDS skin+cull
+    //           3=hybrid, 4=draw-only u16, 5=VS-inline skin, 6=CS fused skin+cull,
+    //           7=CS LDS skin+cull, 8=CS LDS skin+cull + per-cube u16 compact
     // Intent "cull_mode" で上書き可能。未指定時は cull から推定（cull=0→0, cull=1→1）
     int           cullMode    = 1;
     int           cubeCount   = 60;     // Intent の "num_cubes" で上書き可能
@@ -1771,6 +1826,78 @@ static void CreateSkinCullLdsPipeline(App& app) {
     LOGI("ComputePipeline (skin+cull LDS mode=7) created, meshlets=%u", app.vk.meshletCount);
 }
 
+// ---- mode=8: CS LDS skin+cull + per-cube u16 compact index ----
+static void CreateSkinCullLdsU16Pipeline(App& app) {
+    VkDescriptorSetLayoutBinding bindings[6]{};
+    for (uint32_t i = 0; i < 6; i++) {
+        bindings[i].binding         = i;
+        bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI.bindingCount = 6;
+    dslCI.pBindings    = bindings;
+    CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.skinCullLdsU16DescLayout));
+
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6};
+    VkDescriptorPoolCreateInfo dpCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpCI.maxSets = 1; dpCI.poolSizeCount = 1; dpCI.pPoolSizes = &poolSize;
+    CHECK_VK(vkCreateDescriptorPool(app.vk.device, &dpCI, nullptr, &app.vk.skinCullLdsU16DescPool));
+
+    VkDescriptorSetAllocateInfo dsAI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsAI.descriptorPool = app.vk.skinCullLdsU16DescPool;
+    dsAI.descriptorSetCount = 1; dsAI.pSetLayouts = &app.vk.skinCullLdsU16DescLayout;
+    CHECK_VK(vkAllocateDescriptorSets(app.vk.device, &dsAI, &app.vk.skinCullLdsU16DescSet));
+
+    VkDescriptorBufferInfo bufInfos[6] = {
+        { app.vk.meshletBuffer,         0, VK_WHOLE_SIZE },
+        { app.vk.vertexBuffer,          0, VK_WHOLE_SIZE },
+        { app.vk.boneBuffer,            0, VK_WHOLE_SIZE },
+        { app.vk.indexBuffer,           0, VK_WHOLE_SIZE },
+        { app.vk.compactIndexBufferU16, 0, VK_WHOLE_SIZE },
+        { app.vk.bfDrawCmdBufferU16,    0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet writes[6]{};
+    for (uint32_t i = 0; i < 6; i++) {
+        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet          = app.vk.skinCullLdsU16DescSet;
+        writes[i].dstBinding      = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo     = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(app.vk.device, 6, writes, 0, nullptr);
+
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0,
+        sizeof(glm::mat4) * 2 + sizeof(glm::vec4) * 2 + sizeof(uint32_t) * 6};
+    VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plCI.setLayoutCount = 1; plCI.pSetLayouts = &app.vk.skinCullLdsU16DescLayout;
+    plCI.pushConstantRangeCount = 1; plCI.pPushConstantRanges = &pcRange;
+    CHECK_VK(vkCreatePipelineLayout(app.vk.device, &plCI, nullptr, &app.vk.skinCullLdsU16PipelineLayout));
+
+    VkShaderModuleCreateInfo smCI{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smCI.codeSize = skin_cull_lds_u16_spv_size;
+    smCI.pCode    = skin_cull_lds_u16_spv;
+    VkShaderModule mod;
+    CHECK_VK(vkCreateShaderModule(app.vk.device, &smCI, nullptr, &mod));
+
+    VkComputePipelineCreateInfo cpCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroupSizeCI{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
+    subgroupSizeCI.requiredSubgroupSize = 64;
+    cpCI.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpCI.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpCI.stage.module = mod;
+    cpCI.stage.pName  = "main";
+    cpCI.stage.flags  = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+    cpCI.stage.pNext  = &subgroupSizeCI;
+    cpCI.layout       = app.vk.skinCullLdsU16PipelineLayout;
+    CHECK_VK(vkCreateComputePipelines(app.vk.device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &app.vk.skinCullLdsU16Pipeline));
+    vkDestroyShaderModule(app.vk.device, mod, nullptr);
+    LOGI("ComputePipeline (skin+cull LDS u16 mode=8) created, meshlets=%u", app.vk.meshletCount);
+}
+
 // ---- ImageView / Framebuffer / CommandBuffer を作成（multiview: 1 swapchain） ----
 static void CreateFrameResources(App& app, VkFormat colorFormat) {
     // コマンドプール
@@ -1877,6 +2004,7 @@ static void Initialize(App& app) {
     CreateVsSkinPipeline(app, w, h);
     CreateSkinCullPipeline(app);
     CreateSkinCullLdsPipeline(app);
+    CreateSkinCullLdsU16Pipeline(app);
     CreateQueryPool(app);
 
     app.initialized = true;
@@ -1948,6 +2076,7 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     const bool useVsSkin   = (app.cullMode == 5);
     const bool useSkinCull    = (app.cullMode == 6);
     const bool useSkinCullLds = (app.cullMode == 7);
+    const bool useSkinCullLdsU16 = (app.cullMode == 8);
 
     // タイムスタンプリセット（queryPool が有効なときのみ）
     if (app.vk.queryPool != VK_NULL_HANDLE) {
@@ -1961,7 +2090,7 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     }
 
     // ---- Pre-skinning CS（mode=5,6,7 を除く全モード）: LBS で skinnedPos を生成 ----
-    if (!useVsSkin && !useSkinCull && !useSkinCullLds) {
+    if (!useVsSkin && !useSkinCull && !useSkinCullLds && !useSkinCullLdsU16) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.preSkinPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 app.vk.preSkinPipelineLayout, 0, 1,
@@ -1981,12 +2110,12 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     }
 
     if (useU16) {
-        // mode=4: CS 不要、TS_CS_END を即書き込み（CS時間≈0）
+        // mode=4: 追加の culling CS は無い。pre-skin CS の時点をそのまま CS_END とみなす。
         if (app.vk.queryPool != VK_NULL_HANDLE) {
-            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                 app.vk.queryPool, TS_CS_END);
         }
-    } else if (useHybrid || useBackface || useVsSkin || useSkinCull || useSkinCullLds) {
+    } else if (useHybrid || useBackface || useVsSkin || useSkinCull || useSkinCullLds || useSkinCullLdsU16) {
         // ---- Compute: per-triangle backface culling → compactIndex + drawCmd ----
         // mode=5 は posF16Buffer のバインドポーズ座標でカリング（近似）
         // mode=6 は CS 内で LBS してから判定（正確）
@@ -2032,6 +2161,68 @@ static void RenderStereo(App& app, uint32_t imageIdx,
             hpc.cullEnabled   = 1u;
             vkCmdPushConstants(cmd, app.vk.hybridPipelineLayout,
                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hpc), &hpc);
+            vkCmdDispatch(cmd, app.vk.meshletCount, 1, 1);
+        } else if (useSkinCullLdsU16) {
+            struct DrawIndexedIndirectCmd {
+                uint32_t indexCount;
+                uint32_t instanceCount;
+                uint32_t firstIndex;
+                int32_t  vertexOffset;
+                uint32_t firstInstance;
+            };
+            std::vector<DrawIndexedIndirectCmd> initCmds(app.vk.cubeCountStored);
+            const uint32_t indicesPerCube = app.gridN > 1 ? (uint32_t)((app.gridN - 1) * (app.gridN - 1) * 6) : 0u;
+            const uint32_t vertsPerCube   = app.gridN > 1 ? (uint32_t)(app.gridN * app.gridN) : 0u;
+            for (uint32_t c = 0; c < app.vk.cubeCountStored; ++c) {
+                initCmds[c].indexCount    = 0;
+                initCmds[c].instanceCount = 1;
+                initCmds[c].firstIndex    = c * indicesPerCube;
+                initCmds[c].vertexOffset  = (int32_t)(c * vertsPerCube);
+                initCmds[c].firstInstance = 0;
+            }
+            vkCmdUpdateBuffer(cmd, app.vk.bfDrawCmdBufferU16, 0,
+                              (VkDeviceSize)(sizeof(DrawIndexedIndirectCmd) * initCmds.size()),
+                              initCmds.data());
+
+            VkMemoryBarrier fillToCsU16{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            fillToCsU16.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            fillToCsU16.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &fillToCsU16, 0, nullptr, 0, nullptr);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.skinCullLdsU16Pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    app.vk.skinCullLdsU16PipelineLayout, 0, 1,
+                                    &app.vk.skinCullLdsU16DescSet, 0, nullptr);
+
+            struct SkinCullLdsU16PC {
+                glm::mat4 mvp[2];
+                glm::vec4 camPos[2];
+                uint32_t  meshletCount;
+                uint32_t  cullEnabled;
+                uint32_t  frustumEnabled;
+                uint32_t  vertsPerCube;
+                uint32_t  indicesPerCube;
+                uint32_t  _pad1;
+            };
+            SkinCullLdsU16PC lpc{};
+            lpc.mvp[0]         = mvp0;
+            lpc.mvp[1]         = mvp1;
+            lpc.camPos[0]      = glm::vec4(views[0].pose.position.x,
+                                           views[0].pose.position.y,
+                                           views[0].pose.position.z, 0.0f);
+            lpc.camPos[1]      = glm::vec4(views[1].pose.position.x,
+                                           views[1].pose.position.y,
+                                           views[1].pose.position.z, 0.0f);
+            lpc.meshletCount   = app.vk.meshletCount;
+            lpc.cullEnabled    = 1u;
+            lpc.frustumEnabled = (uint32_t)app.mode7Frustum;
+            lpc.vertsPerCube   = vertsPerCube;
+            lpc.indicesPerCube = indicesPerCube;
+            vkCmdPushConstants(cmd, app.vk.skinCullLdsU16PipelineLayout,
+                               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lpc), &lpc);
             vkCmdDispatch(cmd, app.vk.meshletCount, 1, 1);
         } else if (useSkinCullLds) {
             // ---- mode=7: LBS + backface cull、LDS で頂点共有（1 wg = 1 meshlet）----
@@ -2216,7 +2407,7 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     pc.mvp[1]   = mvp1;
     pc.aluIters = (int32_t)app.aluIters;
 
-    if (useVsSkin || useSkinCull || useSkinCullLds) {
+    if (useVsSkin || useSkinCull || useSkinCullLds || useSkinCullLdsU16) {
         // mode=5,6,7: FatVertex+Bone SSBO を VS で読んで LBS
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.vsSkinPipeline);
         vkCmdPushConstants(cmd, app.vk.vsSkinPipelineLayout,
@@ -2235,9 +2426,13 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     }
 
     if (useU16) {
-        // mode=4: per-cube uint16 インデックス、pre-built DrawCmd（60エントリ）
+        // mode=4: draw-pass only compare。per-cube uint16 インデックス、pre-built DrawCmd。
         vkCmdBindIndexBuffer(cmd, app.vk.indexBufferU16, 0, VK_INDEX_TYPE_UINT16);
         vkCmdDrawIndexedIndirect(cmd, app.vk.prebuiltDrawCmdBuffer, 0,
+                                 (uint32_t)app.vk.cubeCountStored, 5 * sizeof(uint32_t));
+    } else if (useSkinCullLdsU16) {
+        vkCmdBindIndexBuffer(cmd, app.vk.compactIndexBufferU16, 0, VK_INDEX_TYPE_UINT16);
+        vkCmdDrawIndexedIndirect(cmd, app.vk.bfDrawCmdBufferU16, 0,
                                  (uint32_t)app.vk.cubeCountStored, 5 * sizeof(uint32_t));
     } else if (useBackface || useHybrid || useVsSkin || useSkinCull || useSkinCullLds) {
         // backface/hybrid/vs-skin/skin-cull: compactIndex を使って 1 drawCall
@@ -2400,9 +2595,12 @@ static void RenderFrame(App& app) {
             LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  Polys=%d  LiveTris=%u/%u (%.1f%%)  mode=%d",
                  fps, avgMs, app.lastCsMs, app.lastGfxMs,
                  polysTotal, liveTris, app.vk.triangleCount, ratio * 100.f, app.cullMode);
+        } else if (app.cullMode == 8) {
+            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  Polys=%d  DrawCalls=%d  mode=8(compact u16)",
+                 fps, avgMs, app.lastCsMs, app.lastGfxMs, polysTotal, app.vk.cubeCountStored);
         } else if (app.cullMode == 4) {
-            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=0ms  GFX=%.3fms  Polys=%d  DrawCalls=%d  mode=4(u16)",
-                 fps, avgMs, app.lastGfxMs, polysTotal, app.vk.cubeCountStored);
+            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  Polys=%d  DrawCalls=%d  mode=4(draw-only u16)",
+                 fps, avgMs, app.lastCsMs, app.lastGfxMs, polysTotal, app.vk.cubeCountStored);
         } else {
             LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  Polys=%d  Meshlets=%u/%u  mode=%d",
                  fps, avgMs, app.lastCsMs, app.lastGfxMs,
@@ -2497,8 +2695,12 @@ static void Cleanup(App& app) {
 
         if (app.vk.compactIndexBuffer) vkDestroyBuffer(app.vk.device, app.vk.compactIndexBuffer, nullptr);
         if (app.vk.compactIndexMemory) vkFreeMemory(app.vk.device, app.vk.compactIndexMemory, nullptr);
+        if (app.vk.compactIndexBufferU16) vkDestroyBuffer(app.vk.device, app.vk.compactIndexBufferU16, nullptr);
+        if (app.vk.compactIndexMemoryU16) vkFreeMemory(app.vk.device, app.vk.compactIndexMemoryU16, nullptr);
         if (app.vk.bfDrawCmdBuffer)    vkDestroyBuffer(app.vk.device, app.vk.bfDrawCmdBuffer, nullptr);
         if (app.vk.bfDrawCmdMemory)    vkFreeMemory(app.vk.device, app.vk.bfDrawCmdMemory, nullptr);
+        if (app.vk.bfDrawCmdBufferU16) vkDestroyBuffer(app.vk.device, app.vk.bfDrawCmdBufferU16, nullptr);
+        if (app.vk.bfDrawCmdMemoryU16) vkFreeMemory(app.vk.device, app.vk.bfDrawCmdMemoryU16, nullptr);
         if (app.vk.bfPipeline)         vkDestroyPipeline(app.vk.device, app.vk.bfPipeline, nullptr);
         if (app.vk.bfPipelineLayout)   vkDestroyPipelineLayout(app.vk.device, app.vk.bfPipelineLayout, nullptr);
         if (app.vk.bfDescPool)         vkDestroyDescriptorPool(app.vk.device, app.vk.bfDescPool, nullptr);
@@ -2536,6 +2738,10 @@ static void Cleanup(App& app) {
         if (app.vk.skinCullLdsPipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.skinCullLdsPipelineLayout, nullptr);
         if (app.vk.skinCullLdsDescPool)        vkDestroyDescriptorPool(app.vk.device, app.vk.skinCullLdsDescPool, nullptr);
         if (app.vk.skinCullLdsDescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.skinCullLdsDescLayout, nullptr);
+        if (app.vk.skinCullLdsU16Pipeline)        vkDestroyPipeline(app.vk.device, app.vk.skinCullLdsU16Pipeline, nullptr);
+        if (app.vk.skinCullLdsU16PipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.skinCullLdsU16PipelineLayout, nullptr);
+        if (app.vk.skinCullLdsU16DescPool)        vkDestroyDescriptorPool(app.vk.device, app.vk.skinCullLdsU16DescPool, nullptr);
+        if (app.vk.skinCullLdsU16DescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.skinCullLdsU16DescLayout, nullptr);
 
         for (auto& sc : app.xr.swapchains) {
             for (auto& si : sc.images) {
@@ -2632,7 +2838,7 @@ static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount,
     if (aluIters >= 0) outAluIters = (int)aluIters;
     if (cull == 0 || cull == 1) outCull = (int)cull;
     if (numCubes >= 1) outCubeCount = (int)numCubes;
-    if (cullMode >= 0 && cullMode <= 7) outCullMode = (int)cullMode;
+    if (cullMode >= 0 && cullMode <= 8) outCullMode = (int)cullMode;
     if (mode7Frustum == 0 || mode7Frustum == 1) outMode7Frustum = (int)mode7Frustum;
     if (resScale >= 0.25f && resScale <= 1.0f) outResScale = (float)resScale;
 }
