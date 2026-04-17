@@ -1,0 +1,40 @@
+#version 450
+
+// Pre-skinning pass: LBS (Linear Blend Skinning) を CPU ボーン行列で適用し、
+// F16 packed 位置バッファに書き込む。後段の VS / Backface CS / Hybrid CS が共通で読む。
+
+layout(local_size_x = 64) in;
+
+struct FatVertex {
+    vec4  pos;      // xyz = bind-pose 位置（w 未使用）
+    vec4  weights;  // 4 本分のスキンウェイト
+    uvec4 boneIdx;  // 4 本分のボーンインデックス
+};
+
+layout(std430, binding = 0) readonly  buffer VertBuf    { FatVertex verts[];  };
+layout(std430, binding = 1) readonly  buffer BoneBuf    { mat4      bones[];  };
+layout(std430, binding = 2) writeonly buffer SkinnedBuf { uvec2     posF16[]; };
+
+layout(push_constant) uniform PC {
+    uint vertexCount;
+} pc;
+
+void main() {
+    uint vi = gl_GlobalInvocationID.x;
+    if (vi >= pc.vertexCount) return;
+
+    FatVertex v = verts[vi];
+    vec4 p = vec4(v.pos.xyz, 1.0);
+
+    vec3 skinned = vec3(0.0);
+    for (int b = 0; b < 4; b++) {
+        float w = v.weights[b];
+        if (w > 0.0) {
+            skinned += w * (bones[v.boneIdx[b]] * p).xyz;
+        }
+    }
+
+    uint packedXY = packHalf2x16(skinned.xy);
+    uint packedZ  = packHalf2x16(vec2(skinned.z, 0.0));
+    posF16[vi] = uvec2(packedXY, packedZ);
+}

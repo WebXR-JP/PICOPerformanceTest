@@ -60,6 +60,10 @@ endfunction()
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/vertex.vert" vertex_spv)
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/fragment.frag" fragment_spv)
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/culling.comp" culling_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/backface_cull.comp" backface_cull_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/hybrid_cull.comp" hybrid_cull_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/pre_skin.comp"    pre_skin_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/vertex_vs_skin.vert" vertex_vs_skin_spv)
 
 # ---- android_native_app_glue（静的ライブラリ）----
 add_library(app_glue STATIC
@@ -75,6 +79,10 @@ add_library(PICOPerformanceTest MODULE
     "${SHADER_GEN_DIR}/vertex_spv.h"
     "${SHADER_GEN_DIR}/fragment_spv.h"
     "${SHADER_GEN_DIR}/culling_spv.h"
+    "${SHADER_GEN_DIR}/backface_cull_spv.h"
+    "${SHADER_GEN_DIR}/hybrid_cull_spv.h"
+    "${SHADER_GEN_DIR}/pre_skin_spv.h"
+    "${SHADER_GEN_DIR}/vertex_vs_skin_spv.h"
 )
 
 target_include_directories(PICOPerformanceTest PRIVATE

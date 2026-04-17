@@ -1,0 +1,102 @@
+#version 450
+
+// トライアングル単位の裏面カリング（atomicAdd 最適化版）
+//
+// 改善: per-thread atomicAdd → 1回/workgroup
+//   1. 各スレッドで keep を判定
+//   2. shared memory で Hillis-Steele inclusive prefix-sum（6パス, 12 barriers）
+//   3. workgroup 代表（lid==0）が total * 3 を atomicAdd → s_base を取得
+//   4. 各生存スレッドが s_base + exclusivePrefix * 3 に書き込む
+
+layout(local_size_x = 64) in;
+
+// F16 位置バッファ: 頂点ごとに uvec2（8 bytes）
+//   .x = fp16(pos.x) | (fp16(pos.y) << 16)
+//   .y = fp16(pos.z)
+layout(std430, binding = 0) readonly  buffer PosF16Buf { uvec2 posF16[];     };
+layout(std430, binding = 1) readonly  buffer SrcIdxBuf { uint  srcIndices[]; };
+layout(std430, binding = 2) writeonly buffer DstIdxBuf { uint  dstIndices[]; };
+
+struct DrawCmd {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+layout(std430, binding = 3) coherent buffer DrawCmdBuf { DrawCmd cmd; };
+
+layout(push_constant) uniform PC {
+    vec4 camPos[2];   // .xyz 左右眼のワールド空間カメラ位置
+    uint triCount;
+    uint cullEnabled;
+    uint _pad0;
+    uint _pad1;
+} pc;
+
+shared uint s_scan[64]; // Hillis-Steele スキャン作業域
+shared uint s_base;     // このワークグループの出力バッファ開始スロット
+
+vec3 readPos(uint vi) {
+    uvec2 p = posF16[vi];
+    vec2 xy = unpackHalf2x16(p.x);
+    vec2 zw = unpackHalf2x16(p.y);
+    return vec3(xy.x, xy.y, zw.x);
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint tri = gl_GlobalInvocationID.x;
+
+    bool keep = false;
+    uint i0 = 0u, i1 = 0u, i2 = 0u;
+
+    if (tri < pc.triCount) {
+        i0 = srcIndices[tri * 3u + 0u];
+        i1 = srcIndices[tri * 3u + 1u];
+        i2 = srcIndices[tri * 3u + 2u];
+
+        keep = true;
+        if (pc.cullEnabled != 0u) {
+            vec3 p0 = readPos(i0);
+            vec3 p1 = readPos(i1);
+            vec3 p2 = readPos(i2);
+
+            vec3 n = cross(p1 - p0, p2 - p0);
+            vec3 c = (p0 + p1 + p2) * (1.0 / 3.0);
+
+            bool backL = dot(c - pc.camPos[0].xyz, n) > 0.0;
+            bool backR = dot(c - pc.camPos[1].xyz, n) > 0.0;
+            keep = !(backL && backR);
+        }
+    }
+
+    // --- Hillis-Steele inclusive prefix-sum ---
+    // s_scan[k] = sum(keep[0..k]) after 6 passes
+    s_scan[lid] = keep ? 1u : 0u;
+    barrier();
+
+    for (uint d = 1u; d < 64u; d <<= 1u) {
+        uint val = s_scan[lid];
+        if (lid >= d) val += s_scan[lid - d];
+        barrier();
+        s_scan[lid] = val;
+        barrier();
+    }
+    // s_scan[63] = workgroup 内の生存トライアングル数
+
+    if (lid == 0u) {
+        uint total = s_scan[63];
+        s_base = (total > 0u) ? atomicAdd(cmd.indexCount, total * 3u) : 0u;
+    }
+    barrier();
+
+    if (keep) {
+        // exclusive prefix = inclusive[lid-1]（lid==0 は 0）
+        uint exclPrefix = (lid == 0u) ? 0u : s_scan[lid - 1u];
+        uint slot = s_base + exclPrefix * 3u;
+        dstIndices[slot + 0u] = i0;
+        dstIndices[slot + 1u] = i1;
+        dstIndices[slot + 2u] = i2;
+    }
+}
