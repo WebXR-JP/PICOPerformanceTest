@@ -1,17 +1,27 @@
 #version 450
 #extension GL_EXT_multiview : enable
+#extension GL_EXT_shader_16bit_storage : enable
 
-// mode=5: VS が FatVertex + BoneMatrix を直接読んで LBS を実行。
-// pre-skin CS の posF16 書き出しなし → 帯域 vs ALU の切り分けテスト用。
+// mode=5,6,7: VS が FatVertex + BoneData(mat4 fp16, 16要素/骨) を読んで LBS を実行。
 
 struct FatVertex {
-    vec4  pos;      // xyz = bind-pose, w unused
-    vec4  weights;  // 4 skin weights
-    uvec4 boneIdx;  // 4 global bone indices
+    vec4  pos;
+    vec4  weights;
+    uvec4 boneIdx;
 };
 
-layout(std430, binding = 0) readonly buffer FatVertBuf { FatVertex verts[]; };
-layout(std430, binding = 1) readonly buffer BoneBuf    { mat4      bones[]; };
+layout(std430, binding = 0) readonly buffer FatVertBuf { FatVertex  verts[];    };
+layout(std430, binding = 1) readonly buffer BoneBuf    { float16_t  boneData[]; };
+
+mat4 getBone(uint idx) {
+    uint b = idx * 16u;
+    return mat4(
+        float(boneData[b+ 0]), float(boneData[b+ 1]), float(boneData[b+ 2]), float(boneData[b+ 3]),
+        float(boneData[b+ 4]), float(boneData[b+ 5]), float(boneData[b+ 6]), float(boneData[b+ 7]),
+        float(boneData[b+ 8]), float(boneData[b+ 9]), float(boneData[b+10]), float(boneData[b+11]),
+        float(boneData[b+12]), float(boneData[b+13]), float(boneData[b+14]), float(boneData[b+15])
+    );
+}
 
 layout(push_constant) uniform PushConstants {
     mat4 mvp[2];
@@ -25,9 +35,7 @@ void main() {
     vec3 skinned = vec3(0.0);
     for (int b = 0; b < 4; b++) {
         float w = v.weights[b];
-        if (w > 0.0) {
-            skinned += w * (bones[v.boneIdx[b]] * p).xyz;
-        }
+        if (w > 0.0) skinned += w * (getBone(v.boneIdx[b]) * p).xyz;
     }
 
     float dummy = 0.0;

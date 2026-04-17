@@ -3,12 +3,10 @@
 layout(local_size_x = 64) in;
 
 struct Meshlet {
-    vec3 aabbMin;
-    uint indexOffset;
-    vec3 aabbMax;
-    uint indexCount;
-    vec3 normal;         // モデル空間の面法線（backface culling 用）
-    uint _pad;
+    vec3 aabbMin;   uint indexOffset;
+    vec3 aabbMax;   uint indexCount;
+    vec3 normal;    uint boneBase;
+    uint boneCount; uint _pad0; uint _pad1; uint _pad2;
 };
 
 struct DrawCmd {
