@@ -22,6 +22,7 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
 #include <cassert>
@@ -39,6 +40,8 @@
 #include "hybrid_cull_spv.h"
 #include "pre_skin_spv.h"
 #include "vertex_vs_skin_spv.h"
+#include "skin_cull_spv.h"
+#include "skin_cull_lds_spv.h"
 
 // ---- ログマクロ ----
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "PICOPerfTest", __VA_ARGS__)
@@ -186,6 +189,20 @@ struct VulkanCtx {
     VkDescriptorSet       vsSkinDescSet         = VK_NULL_HANDLE;
     VkPipelineLayout      vsSkinPipelineLayout  = VK_NULL_HANDLE;
     VkPipeline            vsSkinPipeline        = VK_NULL_HANDLE;
+
+    // ---- mode=6: CS fused skin+cull（posF16Buffer 不要）----
+    VkDescriptorSetLayout skinCullDescLayout    = VK_NULL_HANDLE;
+    VkDescriptorPool      skinCullDescPool      = VK_NULL_HANDLE;
+    VkDescriptorSet       skinCullDescSet       = VK_NULL_HANDLE;
+    VkPipelineLayout      skinCullPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline            skinCullPipeline      = VK_NULL_HANDLE;
+
+    // ---- mode=7: CS LDS skin+cull（1 workgroup = 1 meshlet）----
+    VkDescriptorSetLayout skinCullLdsDescLayout    = VK_NULL_HANDLE;
+    VkDescriptorPool      skinCullLdsDescPool      = VK_NULL_HANDLE;
+    VkDescriptorSet       skinCullLdsDescSet       = VK_NULL_HANDLE;
+    VkPipelineLayout      skinCullLdsPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline            skinCullLdsPipeline      = VK_NULL_HANDLE;
 };
 
 // timestamp index 定数
@@ -318,10 +335,12 @@ struct Meshlet {
     uint32_t  indexOffset;
     glm::vec3 aabbMax;
     uint32_t  indexCount;
-    glm::vec3 normal;     // モデル空間の面法線（backface culling 用）
-    uint32_t  _pad;
+    glm::vec3 normal;
+    uint32_t  boneBase;   // このmeshletが使う最初のグローバル骨インデックス
+    uint32_t  boneCount;  // ユニーク骨数
+    uint32_t  _pad[3];
 };
-static_assert(sizeof(Meshlet) == 48, "Meshlet struct must be 48 bytes (std430)");
+static_assert(sizeof(Meshlet) == 64, "Meshlet struct must be 64 bytes (std430)");
 
 // ============================================================
 // 複数立方体メッシュ生成（world 空間に 3D 格子配置、meshlet 分割）
@@ -345,8 +364,8 @@ static uint16_t FloatToHalf(float f) {
 static void UpdateBones(VulkanCtx& vk, float time) {
     const uint32_t N = vk.totalBones;
     if (N == 0) return;
-    std::vector<glm::mat4> mats((size_t)N);
-    const float amp = glm::radians(8.0f); // 最大 ±8° 回転
+    const float amp = glm::radians(8.0f);
+    std::vector<uint16_t> boneData(16u * N);
     for (uint32_t i = 0; i < N; i++) {
         int bInCube = (int)(i % (uint32_t)BONES_PER_CUBE);
         float phase = (float)bInCube * (glm::pi<float>() * 0.25f);
@@ -355,11 +374,15 @@ static void UpdateBones(VulkanCtx& vk, float time) {
         glm::mat4 T1 = glm::translate(glm::mat4(1.0f),  piv);
         glm::mat4 R  = glm::rotate(glm::mat4(1.0f), ang, glm::vec3(0.0f, 1.0f, 0.0f));
         glm::mat4 T0 = glm::translate(glm::mat4(1.0f), -piv);
-        mats[i] = T1 * R * T0;
+        glm::mat4 m  = T1 * R * T0;
+        const float* src = glm::value_ptr(m);
+        uint16_t* dst = boneData.data() + i * 16u;
+        for (int k = 0; k < 16; k++) dst[k] = FloatToHalf(src[k]);
     }
     void* p = nullptr;
-    vkMapMemory(vk.device, vk.boneMemory, 0, sizeof(glm::mat4) * N, 0, &p);
-    memcpy(p, mats.data(), sizeof(glm::mat4) * N);
+    VkDeviceSize bSize = sizeof(uint16_t) * 16u * N;
+    vkMapMemory(vk.device, vk.boneMemory, 0, bSize, 0, &p);
+    memcpy(p, boneData.data(), bSize);
     vkUnmapMemory(vk.device, vk.boneMemory);
 }
 
@@ -522,7 +545,8 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                     m.indexOffset = offsetStart;
                     m.indexCount  = (uint32_t)iPerMeshlet;
                     m.normal      = fN;
-                    m._pad        = 0;
+                    m.boneBase    = (uint32_t)(c * BONES_PER_CUBE);
+                    m.boneCount   = (uint32_t)BONES_PER_CUBE;
                 }
             }
         }
@@ -668,19 +692,24 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
         vkUnmapMemory(vk.device, vk.prebuiltDrawCmdMemory);
     }
 
-    // ---- Bone buffer (60 cubes × 8 bones = 480 mat4)、CPU が毎フレーム更新 ----
+    // ---- Bone buffer (60 cubes × 8 bones = 480 bones)、mat4 fp16（16要素/骨、列優先）、CPU が毎フレーム更新 ----
     vk.totalBones = (uint32_t)(cubeCount * BONES_PER_CUBE);
-    VkDeviceSize bSize = sizeof(glm::mat4) * vk.totalBones;
+    VkDeviceSize bSize = sizeof(uint16_t) * 16u * vk.totalBones;
     CreateBuffer(vk, bSize,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  vk.boneBuffer, vk.boneMemory);
-    // 初期値は identity（最初のフレームは bind pose）
+    // 初期値は identity（fp16 対角1.0=0x3C00）
     {
-        std::vector<glm::mat4> identities(vk.totalBones, glm::mat4(1.0f));
+        std::vector<uint16_t> identData(16u * vk.totalBones, 0u);
+        static const uint16_t one = 0x3C00u;
+        for (uint32_t i = 0; i < vk.totalBones; i++) {
+            uint16_t* m = identData.data() + i * 16u;
+            m[0] = m[5] = m[10] = m[15] = one;
+        }
         void* p;
         vkMapMemory(vk.device, vk.boneMemory, 0, bSize, 0, &p);
-        memcpy(p, identities.data(), bSize);
+        memcpy(p, identData.data(), bSize);
         vkUnmapMemory(vk.device, vk.boneMemory);
     }
 }
@@ -697,11 +726,13 @@ struct App {
     int           instCount   = 1;      // Intent の "inst_count" で上書き可能
     int           aluIters    = 0;      // Intent の "alu_iters" で上書き可能
     int           cullEnabled = 1;      // Intent の "cull" で上書き可能（0=無効）
-    // cullMode: 0=off, 1=meshlet culling, 2=per-triangle backface cull
+    // cullMode: 0=off, 1=meshlet culling, 2=per-triangle backface cull,
+    //           3=hybrid, 4=u16, 5=VS-inline skin, 6=CS fused skin+cull, 7=CS LDS skin+cull
     // Intent "cull_mode" で上書き可能。未指定時は cull から推定（cull=0→0, cull=1→1）
     int           cullMode    = 1;
     int           cubeCount   = 60;     // Intent の "num_cubes" で上書き可能
-    float         resScale    = 1.0f;  // Intent の "res_scale" で上書き可能（0.25-1.0）
+    int           mode7Frustum = 1;     // Intent の "mode7_frustum" で上書き可能
+    float         resScale    = 1.0f;   // Intent の "res_scale" で上書き可能（0.25-1.0）
     uint32_t      lastVisibleCount = 0; // 前フレームの可視 meshlet 数（ログ用）
     uint32_t      lastBfIndexCount = 0; // 前フレームの backface 生存インデックス数
     double        lastCsMs         = 0.0; // 前フレームの CS 時間（ms）
@@ -841,23 +872,32 @@ static void CreateVulkanDevice(App& app) {
         if (!found) { LOGE("VK_KHR_draw_indirect_count not supported"); assert(false); }
     }
 
-    // multiview feature を有効化
+    // multiview / subgroup size control を有効化
     VkPhysicalDeviceMultiviewFeatures multiviewFeatures{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES};
     multiviewFeatures.multiview = VK_TRUE;
+
+    VkPhysicalDeviceVulkan13Features vulkan13Features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    vulkan13Features.subgroupSizeControl = VK_TRUE;
+    vulkan13Features.computeFullSubgroups = VK_TRUE;
+    multiviewFeatures.pNext = &vulkan13Features;
 
     // multiDrawIndirect feature（drawCount > 1 の indirect draw に必須）
     VkPhysicalDeviceFeatures enabledFeatures{};
     enabledFeatures.multiDrawIndirect = VK_TRUE;
 
-    const char* deviceExtensions[] = { VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME };
+    const char* deviceExtensions[] = {
+        VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME,
+        VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
+    };
 
     VkDeviceCreateInfo devCI{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     devCI.pNext                    = &multiviewFeatures;
     devCI.queueCreateInfoCount     = 1;
     devCI.pQueueCreateInfos        = &qci;
     devCI.pEnabledFeatures         = &enabledFeatures;
-    devCI.enabledExtensionCount    = 1;
+    devCI.enabledExtensionCount    = (uint32_t)(sizeof(deviceExtensions) / sizeof(deviceExtensions[0]));
     devCI.ppEnabledExtensionNames  = deviceExtensions;
 
     XrVulkanDeviceCreateInfoKHR xrDevCI{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
@@ -1589,6 +1629,148 @@ static void CreateVsSkinPipeline(App& app, uint32_t width, uint32_t height) {
     LOGI("GraphicsPipeline (VS-skin mode=5) created");
 }
 
+// ---- mode=6: CS fused skin+cull pipeline ----
+// bindings: 0=FatVertex, 1=BoneMatrix, 2=srcIndex, 3=dstIndex, 4=DrawCmd
+static void CreateSkinCullPipeline(App& app) {
+    VkDescriptorSetLayoutBinding bindings[5]{};
+    for (uint32_t i = 0; i < 5; i++) {
+        bindings[i].binding         = i;
+        bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI.bindingCount = 5;
+    dslCI.pBindings    = bindings;
+    CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.skinCullDescLayout));
+
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5};
+    VkDescriptorPoolCreateInfo dpCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpCI.maxSets = 1; dpCI.poolSizeCount = 1; dpCI.pPoolSizes = &poolSize;
+    CHECK_VK(vkCreateDescriptorPool(app.vk.device, &dpCI, nullptr, &app.vk.skinCullDescPool));
+
+    VkDescriptorSetAllocateInfo dsAI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsAI.descriptorPool = app.vk.skinCullDescPool;
+    dsAI.descriptorSetCount = 1; dsAI.pSetLayouts = &app.vk.skinCullDescLayout;
+    CHECK_VK(vkAllocateDescriptorSets(app.vk.device, &dsAI, &app.vk.skinCullDescSet));
+
+    VkDescriptorBufferInfo bufInfos[5] = {
+        { app.vk.vertexBuffer,       0, VK_WHOLE_SIZE },
+        { app.vk.boneBuffer,         0, VK_WHOLE_SIZE },
+        { app.vk.indexBuffer,        0, VK_WHOLE_SIZE },
+        { app.vk.compactIndexBuffer, 0, VK_WHOLE_SIZE },
+        { app.vk.bfDrawCmdBuffer,    0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet writes[5]{};
+    for (uint32_t i = 0; i < 5; i++) {
+        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet          = app.vk.skinCullDescSet;
+        writes[i].dstBinding      = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo     = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(app.vk.device, 5, writes, 0, nullptr);
+
+    // push constant: vec4[2] + uint*4 = 48 bytes（backface_cull.comp と同レイアウト）
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0,
+        sizeof(glm::vec4) * 2 + sizeof(uint32_t) * 4};
+    VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plCI.setLayoutCount = 1; plCI.pSetLayouts = &app.vk.skinCullDescLayout;
+    plCI.pushConstantRangeCount = 1; plCI.pPushConstantRanges = &pcRange;
+    CHECK_VK(vkCreatePipelineLayout(app.vk.device, &plCI, nullptr, &app.vk.skinCullPipelineLayout));
+
+    VkShaderModuleCreateInfo smCI{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smCI.codeSize = skin_cull_spv_size;
+    smCI.pCode    = skin_cull_spv;
+    VkShaderModule mod;
+    CHECK_VK(vkCreateShaderModule(app.vk.device, &smCI, nullptr, &mod));
+
+    VkComputePipelineCreateInfo cpCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpCI.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpCI.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpCI.stage.module = mod;
+    cpCI.stage.pName  = "main";
+    cpCI.layout       = app.vk.skinCullPipelineLayout;
+    CHECK_VK(vkCreateComputePipelines(app.vk.device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &app.vk.skinCullPipeline));
+    vkDestroyShaderModule(app.vk.device, mod, nullptr);
+    LOGI("ComputePipeline (skin+cull fused mode=6) created, triangles=%u", app.vk.triangleCount);
+}
+
+// ---- mode=7: CS LDS skin+cull pipeline（1 workgroup = 1 meshlet）----
+// bindings: 0=meshletBuf, 1=FatVertex, 2=BoneMatrix, 3=srcIndex, 4=dstIndex, 5=DrawCmd
+static void CreateSkinCullLdsPipeline(App& app) {
+    VkDescriptorSetLayoutBinding bindings[6]{};
+    for (uint32_t i = 0; i < 6; i++) {
+        bindings[i].binding         = i;
+        bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI.bindingCount = 6;
+    dslCI.pBindings    = bindings;
+    CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.skinCullLdsDescLayout));
+
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6};
+    VkDescriptorPoolCreateInfo dpCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpCI.maxSets = 1; dpCI.poolSizeCount = 1; dpCI.pPoolSizes = &poolSize;
+    CHECK_VK(vkCreateDescriptorPool(app.vk.device, &dpCI, nullptr, &app.vk.skinCullLdsDescPool));
+
+    VkDescriptorSetAllocateInfo dsAI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsAI.descriptorPool = app.vk.skinCullLdsDescPool;
+    dsAI.descriptorSetCount = 1; dsAI.pSetLayouts = &app.vk.skinCullLdsDescLayout;
+    CHECK_VK(vkAllocateDescriptorSets(app.vk.device, &dsAI, &app.vk.skinCullLdsDescSet));
+
+    VkDescriptorBufferInfo bufInfos[6] = {
+        { app.vk.meshletBuffer,      0, VK_WHOLE_SIZE },
+        { app.vk.vertexBuffer,       0, VK_WHOLE_SIZE },
+        { app.vk.boneBuffer,         0, VK_WHOLE_SIZE },
+        { app.vk.indexBuffer,        0, VK_WHOLE_SIZE },
+        { app.vk.compactIndexBuffer, 0, VK_WHOLE_SIZE },
+        { app.vk.bfDrawCmdBuffer,    0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet writes[6]{};
+    for (uint32_t i = 0; i < 6; i++) {
+        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet          = app.vk.skinCullLdsDescSet;
+        writes[i].dstBinding      = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo     = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(app.vk.device, 6, writes, 0, nullptr);
+
+    // push constant: mat4[2] + vec4[2] + uint*4 = 176 bytes
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0,
+        sizeof(glm::mat4) * 2 + sizeof(glm::vec4) * 2 + sizeof(uint32_t) * 4};
+    VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plCI.setLayoutCount = 1; plCI.pSetLayouts = &app.vk.skinCullLdsDescLayout;
+    plCI.pushConstantRangeCount = 1; plCI.pPushConstantRanges = &pcRange;
+    CHECK_VK(vkCreatePipelineLayout(app.vk.device, &plCI, nullptr, &app.vk.skinCullLdsPipelineLayout));
+
+    VkShaderModuleCreateInfo smCI{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smCI.codeSize = skin_cull_lds_spv_size;
+    smCI.pCode    = skin_cull_lds_spv;
+    VkShaderModule mod;
+    CHECK_VK(vkCreateShaderModule(app.vk.device, &smCI, nullptr, &mod));
+
+    VkComputePipelineCreateInfo cpCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroupSizeCI{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
+    subgroupSizeCI.requiredSubgroupSize = 64;
+    cpCI.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpCI.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpCI.stage.module = mod;
+    cpCI.stage.pName  = "main";
+    cpCI.stage.flags  = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+    cpCI.stage.pNext  = &subgroupSizeCI;
+    cpCI.layout       = app.vk.skinCullLdsPipelineLayout;
+    CHECK_VK(vkCreateComputePipelines(app.vk.device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &app.vk.skinCullLdsPipeline));
+    vkDestroyShaderModule(app.vk.device, mod, nullptr);
+    LOGI("ComputePipeline (skin+cull LDS mode=7) created, meshlets=%u", app.vk.meshletCount);
+}
+
 // ---- ImageView / Framebuffer / CommandBuffer を作成（multiview: 1 swapchain） ----
 static void CreateFrameResources(App& app, VkFormat colorFormat) {
     // コマンドプール
@@ -1693,6 +1875,8 @@ static void Initialize(App& app) {
     CreateHybridCullPipeline(app);
     CreatePreSkinPipeline(app);
     CreateVsSkinPipeline(app, w, h);
+    CreateSkinCullPipeline(app);
+    CreateSkinCullLdsPipeline(app);
     CreateQueryPool(app);
 
     app.initialized = true;
@@ -1762,6 +1946,8 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     const bool useHybrid   = (app.cullMode == 3);
     const bool useU16      = (app.cullMode == 4);
     const bool useVsSkin   = (app.cullMode == 5);
+    const bool useSkinCull    = (app.cullMode == 6);
+    const bool useSkinCullLds = (app.cullMode == 7);
 
     // タイムスタンプリセット（queryPool が有効なときのみ）
     if (app.vk.queryPool != VK_NULL_HANDLE) {
@@ -1774,8 +1960,8 @@ static void RenderStereo(App& app, uint32_t imageIdx,
                             app.vk.queryPool, TS_CS_BEGIN);
     }
 
-    // ---- Pre-skinning CS（mode=5 を除く全モード）: LBS で skinnedPos を生成 ----
-    if (!useVsSkin) {
+    // ---- Pre-skinning CS（mode=5,6,7 を除く全モード）: LBS で skinnedPos を生成 ----
+    if (!useVsSkin && !useSkinCull && !useSkinCullLds) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.preSkinPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 app.vk.preSkinPipelineLayout, 0, 1,
@@ -1800,9 +1986,11 @@ static void RenderStereo(App& app, uint32_t imageIdx,
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                 app.vk.queryPool, TS_CS_END);
         }
-    } else if (useHybrid || useBackface || useVsSkin) {
+    } else if (useHybrid || useBackface || useVsSkin || useSkinCull || useSkinCullLds) {
         // ---- Compute: per-triangle backface culling → compactIndex + drawCmd ----
         // mode=5 は posF16Buffer のバインドポーズ座標でカリング（近似）
+        // mode=6 は CS 内で LBS してから判定（正確）
+        // mode=7 は LDS 共有で 1 workgroup = 1 meshlet（重複 LBS 排除）
         // drawCmd 全体を毎フレーム初期化（indexCount=0 / instanceCount は動的）
         uint32_t drawCmdInit[5] = {
             0,
@@ -1845,6 +2033,63 @@ static void RenderStereo(App& app, uint32_t imageIdx,
             vkCmdPushConstants(cmd, app.vk.hybridPipelineLayout,
                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hpc), &hpc);
             vkCmdDispatch(cmd, app.vk.meshletCount, 1, 1);
+        } else if (useSkinCullLds) {
+            // ---- mode=7: LBS + backface cull、LDS で頂点共有（1 wg = 1 meshlet）----
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.skinCullLdsPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    app.vk.skinCullLdsPipelineLayout, 0, 1,
+                                    &app.vk.skinCullLdsDescSet, 0, nullptr);
+
+            struct SkinCullLdsPC {
+                glm::mat4 mvp[2];
+                glm::vec4 camPos[2];
+                uint32_t  meshletCount;
+                uint32_t  cullEnabled;
+                uint32_t  frustumEnabled;
+                uint32_t  _pad1;
+            };
+            SkinCullLdsPC lpc{};
+            lpc.mvp[0]       = mvp0;
+            lpc.mvp[1]       = mvp1;
+            lpc.camPos[0]    = glm::vec4(views[0].pose.position.x,
+                                         views[0].pose.position.y,
+                                         views[0].pose.position.z, 0.0f);
+            lpc.camPos[1]    = glm::vec4(views[1].pose.position.x,
+                                         views[1].pose.position.y,
+                                         views[1].pose.position.z, 0.0f);
+            lpc.meshletCount = app.vk.meshletCount;
+            lpc.cullEnabled  = 1u;
+            lpc.frustumEnabled = (uint32_t)app.mode7Frustum;
+            vkCmdPushConstants(cmd, app.vk.skinCullLdsPipelineLayout,
+                               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lpc), &lpc);
+            vkCmdDispatch(cmd, app.vk.meshletCount, 1, 1);
+        } else if (useSkinCull) {
+            // ---- mode=6: LBS + backface cull を 1 CS に融合 ----
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.skinCullPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    app.vk.skinCullPipelineLayout, 0, 1,
+                                    &app.vk.skinCullDescSet, 0, nullptr);
+
+            struct SkinCullPC {
+                glm::vec4 camPos[2];
+                uint32_t  triCount;
+                uint32_t  cullEnabled;
+                uint32_t  _pad0;
+                uint32_t  _pad1;
+            };
+            SkinCullPC scp{};
+            scp.camPos[0]   = glm::vec4(views[0].pose.position.x,
+                                        views[0].pose.position.y,
+                                        views[0].pose.position.z, 0.0f);
+            scp.camPos[1]   = glm::vec4(views[1].pose.position.x,
+                                        views[1].pose.position.y,
+                                        views[1].pose.position.z, 0.0f);
+            scp.triCount    = app.vk.triangleCount;
+            scp.cullEnabled = 1u;
+            vkCmdPushConstants(cmd, app.vk.skinCullPipelineLayout,
+                               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(scp), &scp);
+            uint32_t groups = (app.vk.triangleCount + 63) / 64;
+            vkCmdDispatch(cmd, groups, 1, 1);
         } else {
             // ---- Backface: 1 thread = 1 tri（F16 位置バッファ使用）----
             // mode=5 も同じ CS を使用（posF16Buffer はバインドポーズ or 前フレームの skinned）
@@ -1971,8 +2216,8 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     pc.mvp[1]   = mvp1;
     pc.aluIters = (int32_t)app.aluIters;
 
-    if (useVsSkin) {
-        // mode=5: FatVertex+Bone SSBO を VS で読んで LBS
+    if (useVsSkin || useSkinCull || useSkinCullLds) {
+        // mode=5,6,7: FatVertex+Bone SSBO を VS で読んで LBS
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.vsSkinPipeline);
         vkCmdPushConstants(cmd, app.vk.vsSkinPipelineLayout,
                            VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
@@ -1994,8 +2239,8 @@ static void RenderStereo(App& app, uint32_t imageIdx,
         vkCmdBindIndexBuffer(cmd, app.vk.indexBufferU16, 0, VK_INDEX_TYPE_UINT16);
         vkCmdDrawIndexedIndirect(cmd, app.vk.prebuiltDrawCmdBuffer, 0,
                                  (uint32_t)app.vk.cubeCountStored, 5 * sizeof(uint32_t));
-    } else if (useBackface || useHybrid || useVsSkin) {
-        // backface/hybrid/vs-skin: compactIndex を使って 1 drawCall
+    } else if (useBackface || useHybrid || useVsSkin || useSkinCull || useSkinCullLds) {
+        // backface/hybrid/vs-skin/skin-cull: compactIndex を使って 1 drawCall
         vkCmdBindIndexBuffer(cmd, app.vk.compactIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexedIndirect(cmd, app.vk.bfDrawCmdBuffer, 0, 1, 0);
     } else {
@@ -2148,7 +2393,7 @@ static void RenderFrame(App& app) {
         double avgMs    = app.frameMsAccum / app.frameCount;
         double fps      = app.frameCount / elapsed;
         int    polysTotal = (int)app.vk.meshletCount * MESHLET_TILE * MESHLET_TILE * 2 * app.instCount;
-        if (app.cullMode == 2 || app.cullMode == 3 || app.cullMode == 5) {
+        if (app.cullMode == 2 || app.cullMode == 3 || app.cullMode == 5 || app.cullMode == 6 || app.cullMode == 7) {
             uint32_t liveTris = app.lastBfIndexCount / 3;
             float    ratio    = app.vk.triangleCount > 0
                                 ? (float)liveTris / (float)app.vk.triangleCount : 0.f;
@@ -2282,6 +2527,16 @@ static void Cleanup(App& app) {
         if (app.vk.vsSkinDescPool)        vkDestroyDescriptorPool(app.vk.device, app.vk.vsSkinDescPool, nullptr);
         if (app.vk.vsSkinDescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.vsSkinDescLayout, nullptr);
 
+        if (app.vk.skinCullPipeline)        vkDestroyPipeline(app.vk.device, app.vk.skinCullPipeline, nullptr);
+        if (app.vk.skinCullPipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.skinCullPipelineLayout, nullptr);
+        if (app.vk.skinCullDescPool)        vkDestroyDescriptorPool(app.vk.device, app.vk.skinCullDescPool, nullptr);
+        if (app.vk.skinCullDescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.skinCullDescLayout, nullptr);
+
+        if (app.vk.skinCullLdsPipeline)        vkDestroyPipeline(app.vk.device, app.vk.skinCullLdsPipeline, nullptr);
+        if (app.vk.skinCullLdsPipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.skinCullLdsPipelineLayout, nullptr);
+        if (app.vk.skinCullLdsDescPool)        vkDestroyDescriptorPool(app.vk.device, app.vk.skinCullLdsDescPool, nullptr);
+        if (app.vk.skinCullLdsDescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.skinCullLdsDescLayout, nullptr);
+
         for (auto& sc : app.xr.swapchains) {
             for (auto& si : sc.images) {
                 if (si.framebuffer) vkDestroyFramebuffer(app.vk.device, si.framebuffer, nullptr);
@@ -2313,7 +2568,7 @@ static void Cleanup(App& app) {
 //   adb shell am start -n com.example.picoperftest/android.app.NativeActivity \
 //       --ei grid_n 17 --ei inst_count 10000
 // ============================================================
-static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount, int& outAluIters, int& outCull, int& outCubeCount, int& outCullMode, float& outResScale) {
+static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount, int& outAluIters, int& outCull, int& outCubeCount, int& outCullMode, int& outMode7Frustum, float& outResScale) {
     JNIEnv* env = nullptr;
     aApp->activity->vm->AttachCurrentThread(&env, nullptr);
 
@@ -2352,6 +2607,10 @@ static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount,
     jint    cullMode = env->CallIntMethod(intent, getIntExtra, keyMode, (jint)outCullMode);
     env->DeleteLocalRef(keyMode);
 
+    jstring keyMode7Frustum = env->NewStringUTF("mode7_frustum");
+    jint    mode7Frustum    = env->CallIntMethod(intent, getIntExtra, keyMode7Frustum, (jint)outMode7Frustum);
+    env->DeleteLocalRef(keyMode7Frustum);
+
     jstring keyResScale = env->NewStringUTF("res_scale");
     jfloat  resScale    = env->CallFloatMethod(intent, getFloatExtra, keyResScale, (jfloat)outResScale);
     env->DeleteLocalRef(keyResScale);
@@ -2373,7 +2632,8 @@ static void GetIntentParams(android_app* aApp, int& outGridN, int& outInstCount,
     if (aluIters >= 0) outAluIters = (int)aluIters;
     if (cull == 0 || cull == 1) outCull = (int)cull;
     if (numCubes >= 1) outCubeCount = (int)numCubes;
-    if (cullMode >= 0 && cullMode <= 5) outCullMode = (int)cullMode;
+    if (cullMode >= 0 && cullMode <= 7) outCullMode = (int)cullMode;
+    if (mode7Frustum == 0 || mode7Frustum == 1) outMode7Frustum = (int)mode7Frustum;
     if (resScale >= 0.25f && resScale <= 1.0f) outResScale = (float)resScale;
 }
 
@@ -2406,11 +2666,11 @@ void android_main(android_app* aApp) {
     app.gridN = 97;
     // cull_mode の初期値を cull から推定（未指定時）
     app.cullMode = app.cullEnabled ? 1 : 0;
-    GetIntentParams(aApp, app.gridN, app.instCount, app.aluIters, app.cullEnabled, app.cubeCount, app.cullMode, app.resScale);
+    GetIntentParams(aApp, app.gridN, app.instCount, app.aluIters, app.cullEnabled, app.cubeCount, app.cullMode, app.mode7Frustum, app.resScale);
     // Intent の cull が明示的に 0 なら cullMode も 0 に上書き（後方互換）
     if (app.cullEnabled == 0) app.cullMode = 0;
-    LOGI("grid_n=%d  num_cubes=%d  inst_count=%d  alu_iters=%d  cull=%d  cull_mode=%d  res_scale=%.2f",
-         app.gridN, app.cubeCount, app.instCount, app.aluIters, app.cullEnabled, app.cullMode, app.resScale);
+    LOGI("grid_n=%d  num_cubes=%d  inst_count=%d  alu_iters=%d  cull=%d  cull_mode=%d  mode7_frustum=%d  res_scale=%.2f",
+         app.gridN, app.cubeCount, app.instCount, app.aluIters, app.cullEnabled, app.cullMode, app.mode7Frustum, app.resScale);
 
     // OpenXR ローダーおよびランタイムへの接続に JNI スレッドのアタッチが必要。
     // PICO SDK フレームワーク (BasicOpenXrWrapper) は xrInitializeLoaderKHR の前に

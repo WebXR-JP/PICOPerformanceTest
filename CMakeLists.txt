@@ -45,7 +45,7 @@ function(embed_shader SOURCE_GLSL VAR_NAME)
     set(HDR_FILE  "${SHADER_GEN_DIR}/${VAR_NAME}.h")
     add_custom_command(
         OUTPUT "${HDR_FILE}"
-        COMMAND "${GLSLC}" --target-env=vulkan1.0 -o "${SPV_FILE}" "${SOURCE_GLSL}"
+        COMMAND "${GLSLC}" --target-env=vulkan1.1 -o "${SPV_FILE}" "${SOURCE_GLSL}"
         COMMAND "${CMAKE_COMMAND}"
             "-DINPUT=${SPV_FILE}"
             "-DOUTPUT=${HDR_FILE}"
@@ -64,6 +64,8 @@ embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/backface_cull.comp" backface_c
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/hybrid_cull.comp" hybrid_cull_spv)
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/pre_skin.comp"    pre_skin_spv)
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/vertex_vs_skin.vert" vertex_vs_skin_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/skin_cull.comp"    skin_cull_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/skin_cull_lds.comp" skin_cull_lds_spv)
 
 # ---- android_native_app_glue（静的ライブラリ）----
 add_library(app_glue STATIC
@@ -83,6 +85,8 @@ add_library(PICOPerformanceTest MODULE
     "${SHADER_GEN_DIR}/hybrid_cull_spv.h"
     "${SHADER_GEN_DIR}/pre_skin_spv.h"
     "${SHADER_GEN_DIR}/vertex_vs_skin_spv.h"
+    "${SHADER_GEN_DIR}/skin_cull_spv.h"
+    "${SHADER_GEN_DIR}/skin_cull_lds_spv.h"
 )
 
 target_include_directories(PICOPerformanceTest PRIVATE
