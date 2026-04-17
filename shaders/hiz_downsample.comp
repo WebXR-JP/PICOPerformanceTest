@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2DArray srcMotion;
+layout(binding = 1, rgba16f) uniform writeonly image2DArray dstMotion;
+
+layout(push_constant) uniform PC {
+    uint dstWidth;
+    uint dstHeight;
+    uint validEyeCount;
+    uint _pad0;
+} pc;
+
+void main() {
+    uvec2 dstXY = gl_GlobalInvocationID.xy;
+    uint  eye   = gl_GlobalInvocationID.z;
+    if (dstXY.x >= pc.dstWidth || dstXY.y >= pc.dstHeight || eye >= pc.validEyeCount) return;
+
+    ivec2 srcBase = ivec2(dstXY * 2u);
+    vec4  motionSum = vec4(0.0);
+    for (int oy = 0; oy < 2; ++oy) {
+        for (int ox = 0; ox < 2; ++ox) {
+            ivec2 srcXY = srcBase + ivec2(ox, oy);
+            motionSum += texelFetch(srcMotion, ivec3(srcXY, int(eye)), 0);
+        }
+    }
+
+    imageStore(dstMotion, ivec3(dstXY, int(eye)), motionSum * 0.25);
+}

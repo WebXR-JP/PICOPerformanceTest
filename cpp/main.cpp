@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,8 @@
 #include "skin_cull_spv.h"
 #include "skin_cull_lds_spv.h"
 #include "skin_cull_lds_u16_spv.h"
+#include "hiz_spd_spv.h"
+#include "hiz_downsample_spv.h"
 
 // ---- ログマクロ ----
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "PICOPerfTest", __VA_ARGS__)
@@ -84,7 +87,7 @@
 struct SwapchainImage {
     VkImage     image;
     VkImageView view;
-    VkFramebuffer framebuffer;
+    VkFramebuffer framebuffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
 };
 
 struct EyeSwapchain {
@@ -96,6 +99,21 @@ struct EyeSwapchain {
     VkImage        depthImage  = VK_NULL_HANDLE;
     VkDeviceMemory depthMemory = VK_NULL_HANDLE;
     VkImageView    depthView   = VK_NULL_HANDLE;
+    VkImage        prevDepthImages[2]  = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory prevDepthMemories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImageView    prevDepthViews[2]   = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImage        motionImages[2]     = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory motionMemories[2]   = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImageView    motionViews[2]      = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImage        hiZImages[2]        = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory hiZMemories[2]      = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImage        motionHalfImages[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory motionHalfMemories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    std::vector<VkImageView> hiZMipViews[2];
+    std::vector<VkImageView> motionHalfMipViews[2];
+    uint32_t       hiZW                = 0;
+    uint32_t       hiZH                = 0;
+    uint32_t       hiZMipCount         = 0;
 };
 
 struct VulkanCtx {
@@ -212,18 +230,34 @@ struct VulkanCtx {
     // ---- mode=7: CS LDS skin+cull（1 workgroup = 1 meshlet）----
     VkDescriptorSetLayout skinCullLdsDescLayout    = VK_NULL_HANDLE;
     VkDescriptorPool      skinCullLdsDescPool      = VK_NULL_HANDLE;
-    VkDescriptorSet       skinCullLdsDescSet       = VK_NULL_HANDLE;
+    VkDescriptorSet       skinCullLdsDescSets[2]   = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkPipelineLayout      skinCullLdsPipelineLayout = VK_NULL_HANDLE;
     VkPipeline            skinCullLdsPipeline      = VK_NULL_HANDLE;
+    VkSampler             prevDepthSampler         = VK_NULL_HANDLE;
+    VkBuffer              hiZSpdAtomicBuffer       = VK_NULL_HANDLE;
+    VkDeviceMemory        hiZSpdAtomicMemory       = VK_NULL_HANDLE;
+    VkDescriptorSetLayout hiZSpdDescLayout         = VK_NULL_HANDLE;
+    VkDescriptorPool      hiZSpdDescPool           = VK_NULL_HANDLE;
+    VkDescriptorSet       hiZSpdDescSets[2]        = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkPipelineLayout      hiZSpdPipelineLayout     = VK_NULL_HANDLE;
+    VkPipeline            hiZSpdPipeline           = VK_NULL_HANDLE;
+    VkDescriptorSetLayout hiZDownsampleDescLayout  = VK_NULL_HANDLE;
+    VkDescriptorPool      hiZDownsampleDescPool    = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> hiZDownsampleDescSets[2];
+    VkPipelineLayout      hiZDownsamplePipelineLayout = VK_NULL_HANDLE;
+    VkPipeline            hiZDownsamplePipeline    = VK_NULL_HANDLE;
 };
 
 // timestamp index 定数
 // 0: CS開始, 1: CS終了, 2: Graphics開始, 3: Graphics終了
-static constexpr uint32_t TS_CS_BEGIN  = 0;
-static constexpr uint32_t TS_CS_END    = 1;
-static constexpr uint32_t TS_GFX_BEGIN = 2;
-static constexpr uint32_t TS_GFX_END   = 3;
-static constexpr uint32_t TS_COUNT     = 4;
+static constexpr uint32_t TS_CS_BEGIN         = 0;
+static constexpr uint32_t TS_CS_END           = 1;
+static constexpr uint32_t TS_GFX_BEGIN        = 2;
+static constexpr uint32_t TS_GFX_END          = 3;
+static constexpr uint32_t TS_DOWNSAMPLE_BEGIN = 4;
+static constexpr uint32_t TS_DOWNSAMPLE_END   = 5;
+static constexpr uint32_t TS_COUNT            = 6;
+static constexpr uint32_t HIZ_SPD_MAX_MIPS    = 12;
 
 // ============================================================
 // OpenXR コンテキスト
@@ -340,12 +374,13 @@ static void UploadBufferData(VulkanCtx& vk, VkBuffer dstBuffer, const void* srcD
 static void CreateImage(VulkanCtx& vk, uint32_t w, uint32_t h,
                         VkFormat format, VkImageUsageFlags usage,
                         VkImage& image, VkDeviceMemory& memory,
-                        uint32_t arrayLayers = 1) {
+                        uint32_t arrayLayers = 1,
+                        uint32_t mipLevels = 1) {
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType   = VK_IMAGE_TYPE_2D;
     ci.format      = format;
     ci.extent      = {w, h, 1};
-    ci.mipLevels   = 1;
+    ci.mipLevels   = mipLevels;
     ci.arrayLayers = arrayLayers;
     ci.samples     = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling      = VK_IMAGE_TILING_OPTIMAL;
@@ -362,6 +397,69 @@ static void CreateImage(VulkanCtx& vk, uint32_t w, uint32_t h,
                                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     CHECK_VK(vkAllocateMemory(vk.device, &ai, nullptr, &memory));
     CHECK_VK(vkBindImageMemory(vk.device, image, memory, 0));
+}
+
+static VkImageView CreateImageView(VulkanCtx& vk,
+                                   VkImage image,
+                                   VkFormat format,
+                                   VkImageAspectFlags aspectMask,
+                                   VkImageViewType viewType,
+                                   uint32_t baseMipLevel,
+                                   uint32_t levelCount,
+                                   uint32_t baseArrayLayer,
+                                   uint32_t layerCount) {
+    VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    ci.image = image;
+    ci.viewType = viewType;
+    ci.format = format;
+    ci.subresourceRange = {aspectMask, baseMipLevel, levelCount, baseArrayLayer, layerCount};
+    VkImageView view = VK_NULL_HANDLE;
+    CHECK_VK(vkCreateImageView(vk.device, &ci, nullptr, &view));
+    return view;
+}
+
+static void TransitionImageLayoutNow(VulkanCtx& vk,
+                                     VkImage image,
+                                     VkImageAspectFlags aspectMask,
+                                     VkImageLayout oldLayout,
+                                     VkImageLayout newLayout,
+                                     uint32_t layerCount = 1,
+                                     uint32_t mipCount = 1) {
+    VkCommandBufferAllocateInfo cbAI{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbAI.commandPool = vk.cmdPool;
+    cbAI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbAI.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    CHECK_VK(vkAllocateCommandBuffers(vk.device, &cbAI, &cmd));
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    CHECK_VK(vkBeginCommandBuffer(cmd, &bi));
+
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = {aspectMask, 0, mipCount, 0, layerCount};
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = (newLayout == VK_IMAGE_LAYOUT_GENERAL)
+        ? (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
+        : 0;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+    CHECK_VK(vkEndCommandBuffer(cmd));
+
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    CHECK_VK(vkQueueSubmit(vk.queue, 1, &si, VK_NULL_HANDLE));
+    CHECK_VK(vkQueueWaitIdle(vk.queue));
+    vkFreeCommandBuffers(vk.device, vk.cmdPool, 1, &cmd);
 }
 
 // ============================================================
@@ -792,6 +890,9 @@ struct App {
     uint32_t      lastBfIndexCount = 0; // 前フレームの backface 生存インデックス数
     double        lastCsMs         = 0.0; // 前フレームの CS 時間（ms）
     double        lastGfxMs        = 0.0; // 前フレームの Graphics pass 時間（ms）
+    double        lastDownsampleMs = 0.0; // 前フレームの Hi-Z/MV downsample 時間（ms）
+    uint32_t      frameParity      = 0;
+    bool          prevDepthValid   = false;
 
     // フレーム計測
     using Clock = std::chrono::high_resolution_clock;
@@ -1064,7 +1165,7 @@ static void CreateSwapchains(App& app) {
 
 // ---- RenderPass 作成 ----
 static void CreateRenderPass(App& app, VkFormat colorFormat) {
-    VkAttachmentDescription attachments[2]{};
+    VkAttachmentDescription attachments[4]{};
 
     // カラー
     attachments[0].format         = colorFormat;
@@ -1086,13 +1187,36 @@ static void CreateRenderPass(App& app, VkFormat colorFormat) {
     attachments[1].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
     attachments[1].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
+    // 前フレーム可視性用の深度キャプチャ
+    attachments[2].format         = VK_FORMAT_R32_SFLOAT;
+    attachments[2].samples        = VK_SAMPLE_COUNT_1_BIT;
+    attachments[2].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[2].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[2].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[2].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[2].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[2].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    // MotionVector 想定のキャプチャ
+    attachments[3].format         = VK_FORMAT_R16G16B16A16_SFLOAT;
+    attachments[3].samples        = VK_SAMPLE_COUNT_1_BIT;
+    attachments[3].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachments[3].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+    attachments[3].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachments[3].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachments[3].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachments[3].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
     VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference prevDepthRef{2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference motionRef{3, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference colorRefs[3] = {colorRef, prevDepthRef, motionRef};
 
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount    = 1;
-    subpass.pColorAttachments       = &colorRef;
+    subpass.colorAttachmentCount    = 3;
+    subpass.pColorAttachments       = colorRefs;
     subpass.pDepthStencilAttachment = &depthRef;
 
     VkSubpassDependency dep{};
@@ -1117,7 +1241,7 @@ static void CreateRenderPass(App& app, VkFormat colorFormat) {
 
     VkRenderPassCreateInfo rpCI{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
     rpCI.pNext           = &multiviewCI;
-    rpCI.attachmentCount = 2;
+    rpCI.attachmentCount = 4;
     rpCI.pAttachments    = attachments;
     rpCI.subpassCount    = 1;
     rpCI.pSubpasses      = &subpass;
@@ -1187,14 +1311,17 @@ static void CreatePipeline(App& app, uint32_t width, uint32_t height) {
     dsCI.depthWriteEnable = VK_TRUE;
     dsCI.depthCompareOp   = VK_COMPARE_OP_LESS;
 
-    VkPipelineColorBlendAttachmentState cbAtt{};
-    cbAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendAttachmentState cbAtt[3]{};
+    cbAtt[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    cbAtt[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+    cbAtt[2].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
     VkPipelineColorBlendStateCreateInfo cbCI{
         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cbCI.attachmentCount = 1;
-    cbCI.pAttachments    = &cbAtt;
+    cbCI.attachmentCount = 3;
+    cbCI.pAttachments    = cbAtt;
 
     // Push constants: mat4 mvp[2] + int aluIters = 132 bytes（multiview）
     VkPushConstantRange pcRange{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4) * 2 + sizeof(int32_t)};
@@ -1657,11 +1784,14 @@ static void CreateVsSkinPipeline(App& app, uint32_t width, uint32_t height) {
     dsCI.depthTestEnable  = VK_TRUE;
     dsCI.depthWriteEnable = VK_TRUE;
     dsCI.depthCompareOp   = VK_COMPARE_OP_LESS;
-    VkPipelineColorBlendAttachmentState cbAtt{};
-    cbAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendAttachmentState cbAtt[3]{};
+    cbAtt[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    cbAtt[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+    cbAtt[2].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     VkPipelineColorBlendStateCreateInfo cbCI{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cbCI.attachmentCount = 1; cbCI.pAttachments = &cbAtt;
+    cbCI.attachmentCount = 3; cbCI.pAttachments = cbAtt;
 
     VkGraphicsPipelineCreateInfo gpCI{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gpCI.stageCount          = 2;
@@ -1755,50 +1885,89 @@ static void CreateSkinCullPipeline(App& app) {
 // ---- mode=7: CS LDS skin+cull pipeline（1 workgroup = 1 meshlet）----
 // bindings: 0=meshletBuf, 1=FatVertex, 2=BoneMatrix, 3=srcIndex, 4=dstIndex, 5=DrawCmd
 static void CreateSkinCullLdsPipeline(App& app) {
-    VkDescriptorSetLayoutBinding bindings[6]{};
+    VkDescriptorSetLayoutBinding bindings[7]{};
     for (uint32_t i = 0; i < 6; i++) {
         bindings[i].binding         = i;
         bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
     }
+    bindings[6].binding         = 6;
+    bindings[6].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[6].descriptorCount = 1;
+    bindings[6].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutCreateInfo dslCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslCI.bindingCount = 6;
+    dslCI.bindingCount = 7;
     dslCI.pBindings    = bindings;
     CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.skinCullLdsDescLayout));
 
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6};
+    VkDescriptorPoolSize poolSizes[2] = {
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
+    };
     VkDescriptorPoolCreateInfo dpCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpCI.maxSets = 1; dpCI.poolSizeCount = 1; dpCI.pPoolSizes = &poolSize;
+    dpCI.maxSets = 2;
+    dpCI.poolSizeCount = 2;
+    dpCI.pPoolSizes = poolSizes;
     CHECK_VK(vkCreateDescriptorPool(app.vk.device, &dpCI, nullptr, &app.vk.skinCullLdsDescPool));
 
+    VkSamplerCreateInfo samplerCI{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    samplerCI.magFilter = VK_FILTER_NEAREST;
+    samplerCI.minFilter = VK_FILTER_NEAREST;
+    samplerCI.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerCI.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCI.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerCI.minLod = 0.0f;
+    samplerCI.maxLod = 0.0f;
+    CHECK_VK(vkCreateSampler(app.vk.device, &samplerCI, nullptr, &app.vk.prevDepthSampler));
+
+    VkDescriptorSetLayout setLayouts[2] = {
+        app.vk.skinCullLdsDescLayout,
+        app.vk.skinCullLdsDescLayout,
+    };
     VkDescriptorSetAllocateInfo dsAI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsAI.descriptorPool = app.vk.skinCullLdsDescPool;
-    dsAI.descriptorSetCount = 1; dsAI.pSetLayouts = &app.vk.skinCullLdsDescLayout;
-    CHECK_VK(vkAllocateDescriptorSets(app.vk.device, &dsAI, &app.vk.skinCullLdsDescSet));
+    dsAI.descriptorSetCount = 2;
+    dsAI.pSetLayouts = setLayouts;
+    CHECK_VK(vkAllocateDescriptorSets(app.vk.device, &dsAI, app.vk.skinCullLdsDescSets));
 
-    VkDescriptorBufferInfo bufInfos[6] = {
+    EyeSwapchain& sc = app.xr.swapchains[0];
+    for (uint32_t setIdx = 0; setIdx < 2; ++setIdx) {
+        VkDescriptorBufferInfo bufInfos[6] = {
         { app.vk.meshletBuffer,      0, VK_WHOLE_SIZE },
         { app.vk.vertexBuffer,       0, VK_WHOLE_SIZE },
         { app.vk.boneBuffer,         0, VK_WHOLE_SIZE },
         { app.vk.indexBuffer,        0, VK_WHOLE_SIZE },
         { app.vk.compactIndexBuffer, 0, VK_WHOLE_SIZE },
         { app.vk.bfDrawCmdBuffer,    0, VK_WHOLE_SIZE },
-    };
-    VkWriteDescriptorSet writes[6]{};
-    for (uint32_t i = 0; i < 6; i++) {
-        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet          = app.vk.skinCullLdsDescSet;
-        writes[i].dstBinding      = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo     = &bufInfos[i];
-    }
-    vkUpdateDescriptorSets(app.vk.device, 6, writes, 0, nullptr);
+        };
+        VkDescriptorImageInfo imageInfo{};
+        imageInfo.sampler = app.vk.prevDepthSampler;
+        imageInfo.imageView = sc.prevDepthViews[setIdx];
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    // push constant: mat4[2] + vec4[2] + uint*4 = 176 bytes
+        VkWriteDescriptorSet writes[7]{};
+        for (uint32_t i = 0; i < 6; i++) {
+            writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet          = app.vk.skinCullLdsDescSets[setIdx];
+            writes[i].dstBinding      = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo     = &bufInfos[i];
+        }
+        writes[6].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[6].dstSet          = app.vk.skinCullLdsDescSets[setIdx];
+        writes[6].dstBinding      = 6;
+        writes[6].descriptorCount = 1;
+        writes[6].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[6].pImageInfo      = &imageInfo;
+        vkUpdateDescriptorSets(app.vk.device, 7, writes, 0, nullptr);
+    }
+
+    // push constant: mat4[2] + vec4[2] + uvec4 + vec4 = 192 bytes
     VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0,
-        sizeof(glm::mat4) * 2 + sizeof(glm::vec4) * 2 + sizeof(uint32_t) * 4};
+        sizeof(glm::mat4) * 2 + sizeof(glm::vec4) * 2 + sizeof(uint32_t) * 4 + sizeof(glm::vec4)};
     VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plCI.setLayoutCount = 1; plCI.pSetLayouts = &app.vk.skinCullLdsDescLayout;
     plCI.pushConstantRangeCount = 1; plCI.pPushConstantRanges = &pcRange;
@@ -1824,6 +1993,218 @@ static void CreateSkinCullLdsPipeline(App& app) {
     CHECK_VK(vkCreateComputePipelines(app.vk.device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &app.vk.skinCullLdsPipeline));
     vkDestroyShaderModule(app.vk.device, mod, nullptr);
     LOGI("ComputePipeline (skin+cull LDS mode=7) created, meshlets=%u", app.vk.meshletCount);
+}
+
+static void CreateHiZDownsamplePipeline(App& app) {
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo dslCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI.bindingCount = 2;
+    dslCI.pBindings = bindings;
+    CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.hiZDownsampleDescLayout));
+
+    EyeSwapchain& sc = app.xr.swapchains[0];
+    const uint32_t setCountPerPing = sc.hiZMipCount;
+    VkDescriptorPoolSize poolSizes[2] = {
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, setCountPerPing * 2u},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, setCountPerPing * 2u},
+    };
+    VkDescriptorPoolCreateInfo dpCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpCI.maxSets = setCountPerPing * 2u;
+    dpCI.poolSizeCount = 2;
+    dpCI.pPoolSizes = poolSizes;
+    CHECK_VK(vkCreateDescriptorPool(app.vk.device, &dpCI, nullptr, &app.vk.hiZDownsampleDescPool));
+
+    for (uint32_t ping = 0; ping < 2; ++ping) {
+        app.vk.hiZDownsampleDescSets[ping].resize(setCountPerPing);
+        std::vector<VkDescriptorSetLayout> layouts(setCountPerPing, app.vk.hiZDownsampleDescLayout);
+        VkDescriptorSetAllocateInfo dsAI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dsAI.descriptorPool = app.vk.hiZDownsampleDescPool;
+        dsAI.descriptorSetCount = setCountPerPing;
+        dsAI.pSetLayouts = layouts.data();
+        CHECK_VK(vkAllocateDescriptorSets(app.vk.device, &dsAI, app.vk.hiZDownsampleDescSets[ping].data()));
+
+        for (uint32_t level = 0; level < setCountPerPing; ++level) {
+            VkDescriptorImageInfo imageInfos[2]{};
+            imageInfos[0].sampler = app.vk.prevDepthSampler;
+            if (level == 0u) {
+                imageInfos[0].imageView = sc.motionViews[ping];
+            } else {
+                imageInfos[0].imageView = sc.motionHalfMipViews[ping][level - 1u];
+            }
+            imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfos[1].imageView = sc.motionHalfMipViews[ping][level];
+            imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSet writes[2]{};
+            for (uint32_t i = 0; i < 2; ++i) {
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = app.vk.hiZDownsampleDescSets[ping][level];
+                writes[i].dstBinding = i;
+                writes[i].descriptorCount = 1;
+                writes[i].pImageInfo = &imageInfos[i];
+            }
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            vkUpdateDescriptorSets(app.vk.device, 2, writes, 0, nullptr);
+        }
+    }
+
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 4};
+    VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plCI.setLayoutCount = 1;
+    plCI.pSetLayouts = &app.vk.hiZDownsampleDescLayout;
+    plCI.pushConstantRangeCount = 1;
+    plCI.pPushConstantRanges = &pcRange;
+    CHECK_VK(vkCreatePipelineLayout(app.vk.device, &plCI, nullptr, &app.vk.hiZDownsamplePipelineLayout));
+
+    VkShaderModuleCreateInfo smCI{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smCI.codeSize = hiz_downsample_spv_size;
+    smCI.pCode = hiz_downsample_spv;
+    VkShaderModule mod = VK_NULL_HANDLE;
+    CHECK_VK(vkCreateShaderModule(app.vk.device, &smCI, nullptr, &mod));
+
+    VkComputePipelineCreateInfo cpCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpCI.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpCI.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpCI.stage.module = mod;
+    cpCI.stage.pName = "main";
+    cpCI.layout = app.vk.hiZDownsamplePipelineLayout;
+    CHECK_VK(vkCreateComputePipelines(app.vk.device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &app.vk.hiZDownsamplePipeline));
+    vkDestroyShaderModule(app.vk.device, mod, nullptr);
+}
+
+static void CreateHiZSpdPipeline(App& app) {
+    EyeSwapchain& sc = app.xr.swapchains[0];
+    if (sc.hiZMipCount > HIZ_SPD_MAX_MIPS) {
+        LOGE("Hi-Z mip count %u exceeds SPD limit %u", sc.hiZMipCount, HIZ_SPD_MAX_MIPS);
+        assert(false);
+    }
+
+    CreateBuffer(app.vk, sizeof(uint32_t) * 2u,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 app.vk.hiZSpdAtomicBuffer, app.vk.hiZSpdAtomicMemory);
+    {
+        void* p = nullptr;
+        vkMapMemory(app.vk.device, app.vk.hiZSpdAtomicMemory, 0, sizeof(uint32_t) * 2u, 0, &p);
+        std::memset(p, 0, sizeof(uint32_t) * 2u);
+        vkUnmapMemory(app.vk.device, app.vk.hiZSpdAtomicMemory);
+    }
+
+    VkDescriptorSetLayoutBinding bindings[15]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    for (uint32_t i = 2; i < 15; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
+    VkDescriptorSetLayoutCreateInfo dslCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI.bindingCount = 15;
+    dslCI.pBindings = bindings;
+    CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.hiZSpdDescLayout));
+
+    VkDescriptorPoolSize poolSizes[3] = {
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 13u * 2u},
+    };
+    VkDescriptorPoolCreateInfo dpCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpCI.maxSets = 2;
+    dpCI.poolSizeCount = 3;
+    dpCI.pPoolSizes = poolSizes;
+    CHECK_VK(vkCreateDescriptorPool(app.vk.device, &dpCI, nullptr, &app.vk.hiZSpdDescPool));
+
+    std::vector<VkDescriptorSetLayout> layouts(2, app.vk.hiZSpdDescLayout);
+    VkDescriptorSetAllocateInfo dsAI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsAI.descriptorPool = app.vk.hiZSpdDescPool;
+    dsAI.descriptorSetCount = 2;
+    dsAI.pSetLayouts = layouts.data();
+    CHECK_VK(vkAllocateDescriptorSets(app.vk.device, &dsAI, app.vk.hiZSpdDescSets));
+
+    for (uint32_t ping = 0; ping < 2; ++ping) {
+        VkDescriptorImageInfo srcInfo{};
+        srcInfo.sampler = app.vk.prevDepthSampler;
+        srcInfo.imageView = sc.prevDepthViews[ping];
+        srcInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkDescriptorBufferInfo counterInfo{};
+        counterInfo.buffer = app.vk.hiZSpdAtomicBuffer;
+        counterInfo.offset = 0;
+        counterInfo.range = sizeof(uint32_t) * 2u;
+
+        std::vector<VkDescriptorImageInfo> mipInfos(13);
+        for (uint32_t i = 0; i < mipInfos.size(); ++i) {
+            const uint32_t level = std::min<uint32_t>(i == 0 ? 5u : (i - 1u), sc.hiZMipCount - 1u);
+            mipInfos[i].imageView = sc.hiZMipViews[ping][level];
+            mipInfos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
+
+        std::vector<VkWriteDescriptorSet> writes(15);
+        writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[0].dstSet = app.vk.hiZSpdDescSets[ping];
+        writes[0].dstBinding = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].descriptorCount = 1;
+        writes[0].pImageInfo = &srcInfo;
+
+        writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[1].dstSet = app.vk.hiZSpdDescSets[ping];
+        writes[1].dstBinding = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].descriptorCount = 1;
+        writes[1].pBufferInfo = &counterInfo;
+
+        for (uint32_t i = 0; i < mipInfos.size(); ++i) {
+            writes[i + 2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[i + 2].dstSet = app.vk.hiZSpdDescSets[ping];
+            writes[i + 2].dstBinding = i + 2;
+            writes[i + 2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[i + 2].descriptorCount = 1;
+            writes[i + 2].pImageInfo = &mipInfos[i];
+        }
+        vkUpdateDescriptorSets(app.vk.device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+    }
+
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 4};
+    VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plCI.setLayoutCount = 1;
+    plCI.pSetLayouts = &app.vk.hiZSpdDescLayout;
+    plCI.pushConstantRangeCount = 1;
+    plCI.pPushConstantRanges = &pcRange;
+    CHECK_VK(vkCreatePipelineLayout(app.vk.device, &plCI, nullptr, &app.vk.hiZSpdPipelineLayout));
+
+    VkShaderModuleCreateInfo smCI{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smCI.codeSize = hiz_spd_spv_size;
+    smCI.pCode = hiz_spd_spv;
+    VkShaderModule mod = VK_NULL_HANDLE;
+    CHECK_VK(vkCreateShaderModule(app.vk.device, &smCI, nullptr, &mod));
+
+    VkComputePipelineCreateInfo cpCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpCI.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpCI.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpCI.stage.module = mod;
+    cpCI.stage.pName = "main";
+    cpCI.layout = app.vk.hiZSpdPipelineLayout;
+    CHECK_VK(vkCreateComputePipelines(app.vk.device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &app.vk.hiZSpdPipeline));
+    vkDestroyShaderModule(app.vk.device, mod, nullptr);
 }
 
 // ---- mode=8: CS LDS skin+cull + per-cube u16 compact index ----
@@ -1909,6 +2290,13 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
     // multiview では swapchain は1つ（arraySize=2）
     EyeSwapchain& sc = app.xr.swapchains[0];
     uint32_t imgCount = (uint32_t)sc.images.size();
+    sc.hiZW = (sc.width + 1u) / 2u;
+    sc.hiZH = (sc.height + 1u) / 2u;
+    sc.hiZMipCount = 0;
+    for (uint32_t w = sc.hiZW, h = sc.hiZH; w > 0 && h > 0; w = (w + 1u) / 2u, h = (h + 1u) / 2u) {
+        sc.hiZMipCount++;
+        if (w == 1u && h == 1u) break;
+    }
 
     // デプスバッファ（arrayLayers=2 で両目分）
     CreateImage(app.vk, sc.width, sc.height,
@@ -1925,6 +2313,54 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
                              0, 1, 0, 2 /* layerCount=2 */};
     CHECK_VK(vkCreateImageView(app.vk.device, &dvCI, nullptr, &sc.depthView));
 
+    for (uint32_t ping = 0; ping < 2; ++ping) {
+        CreateImage(app.vk, sc.width, sc.height,
+                    VK_FORMAT_R32_SFLOAT,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    sc.prevDepthImages[ping], sc.prevDepthMemories[ping],
+                    2 /* arrayLayers=2 */);
+
+        VkImageViewCreateInfo pvCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        pvCI.image    = sc.prevDepthImages[ping];
+        pvCI.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        pvCI.format   = VK_FORMAT_R32_SFLOAT;
+        pvCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+        CHECK_VK(vkCreateImageView(app.vk.device, &pvCI, nullptr, &sc.prevDepthViews[ping]));
+
+        CreateImage(app.vk, sc.width, sc.height,
+                    VK_FORMAT_R16G16B16A16_SFLOAT,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    sc.motionImages[ping], sc.motionMemories[ping],
+                    2 /* arrayLayers=2 */);
+        pvCI.image  = sc.motionImages[ping];
+        pvCI.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        CHECK_VK(vkCreateImageView(app.vk.device, &pvCI, nullptr, &sc.motionViews[ping]));
+
+        CreateImage(app.vk, sc.hiZW, sc.hiZH,
+                    VK_FORMAT_R32_SFLOAT,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    sc.hiZImages[ping], sc.hiZMemories[ping],
+                    2 /* arrayLayers=2 */, sc.hiZMipCount);
+        sc.hiZMipViews[ping].resize(sc.hiZMipCount);
+        for (uint32_t level = 0; level < sc.hiZMipCount; ++level) {
+            sc.hiZMipViews[ping][level] = CreateImageView(
+                app.vk, sc.hiZImages[ping], VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_VIEW_TYPE_2D_ARRAY, level, 1, 0, 2);
+        }
+
+        CreateImage(app.vk, sc.hiZW, sc.hiZH,
+                    VK_FORMAT_R16G16B16A16_SFLOAT,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    sc.motionHalfImages[ping], sc.motionHalfMemories[ping],
+                    2 /* arrayLayers=2 */, sc.hiZMipCount);
+        sc.motionHalfMipViews[ping].resize(sc.hiZMipCount);
+        for (uint32_t level = 0; level < sc.hiZMipCount; ++level) {
+            sc.motionHalfMipViews[ping][level] = CreateImageView(
+                app.vk, sc.motionHalfImages[ping], VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_VIEW_TYPE_2D_ARRAY, level, 1, 0, 2);
+        }
+    }
+
     // 各スワップチェーン画像の ImageView + Framebuffer
     for (uint32_t i = 0; i < imgCount; i++) {
         SwapchainImage& si = sc.images[i];
@@ -1937,15 +2373,17 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
         civCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2 /* layerCount=2 */};
         CHECK_VK(vkCreateImageView(app.vk.device, &civCI, nullptr, &si.view));
 
-        VkImageView fbAttachments[] = {si.view, sc.depthView};
-        VkFramebufferCreateInfo fbCI{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-        fbCI.renderPass      = app.vk.renderPass;
-        fbCI.attachmentCount = 2;
-        fbCI.pAttachments    = fbAttachments;
-        fbCI.width           = sc.width;
-        fbCI.height          = sc.height;
-        fbCI.layers          = 1; // multiview では layers=1
-        CHECK_VK(vkCreateFramebuffer(app.vk.device, &fbCI, nullptr, &si.framebuffer));
+        for (uint32_t ping = 0; ping < 2; ++ping) {
+            VkImageView fbAttachments[] = {si.view, sc.depthView, sc.prevDepthViews[ping], sc.motionViews[ping]};
+            VkFramebufferCreateInfo fbCI{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            fbCI.renderPass      = app.vk.renderPass;
+            fbCI.attachmentCount = 4;
+            fbCI.pAttachments    = fbAttachments;
+            fbCI.width           = sc.width;
+            fbCI.height          = sc.height;
+            fbCI.layers          = 1; // multiview では layers=1
+            CHECK_VK(vkCreateFramebuffer(app.vk.device, &fbCI, nullptr, &si.framebuffers[ping]));
+        }
     }
 
     // コマンドバッファ（imageIdx の1次元）
@@ -1960,6 +2398,13 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
     VkFenceCreateInfo fCI{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fCI.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     CHECK_VK(vkCreateFence(app.vk.device, &fCI, nullptr, &app.vk.fence));
+
+    for (uint32_t ping = 0; ping < 2; ++ping) {
+        TransitionImageLayoutNow(app.vk, sc.hiZImages[ping], VK_IMAGE_ASPECT_COLOR_BIT,
+                                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 2, sc.hiZMipCount);
+        TransitionImageLayoutNow(app.vk, sc.motionHalfImages[ping], VK_IMAGE_ASPECT_COLOR_BIT,
+                                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 2, sc.hiZMipCount);
+    }
 }
 
 // ---- 全体初期化 ----
@@ -2004,6 +2449,8 @@ static void Initialize(App& app) {
     CreateVsSkinPipeline(app, w, h);
     CreateSkinCullPipeline(app);
     CreateSkinCullLdsPipeline(app);
+    CreateHiZSpdPipeline(app);
+    CreateHiZDownsamplePipeline(app);
     CreateSkinCullLdsU16Pipeline(app);
     CreateQueryPool(app);
 
@@ -2052,8 +2499,10 @@ static glm::mat4 ComputeMVP(const XrView& view, const glm::mat4& model) {
 static void RenderStereo(App& app, uint32_t imageIdx,
                          const std::vector<XrView>& views,
                          uint32_t swapW, uint32_t swapH) {
+    const uint32_t prevDepthReadIdx  = app.frameParity & 1u;
+    const uint32_t prevDepthWriteIdx = prevDepthReadIdx ^ 1u;
     VkCommandBuffer cmd = app.vk.cmdBuffers[imageIdx];
-    VkFramebuffer   fb  = app.xr.swapchains[0].images[imageIdx].framebuffer;
+    VkFramebuffer   fb  = app.xr.swapchains[0].images[imageIdx].framebuffers[prevDepthWriteIdx];
 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -2229,7 +2678,7 @@ static void RenderStereo(App& app, uint32_t imageIdx,
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.skinCullLdsPipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     app.vk.skinCullLdsPipelineLayout, 0, 1,
-                                    &app.vk.skinCullLdsDescSet, 0, nullptr);
+                                    &app.vk.skinCullLdsDescSets[prevDepthReadIdx], 0, nullptr);
 
             struct SkinCullLdsPC {
                 glm::mat4 mvp[2];
@@ -2237,7 +2686,8 @@ static void RenderStereo(App& app, uint32_t imageIdx,
                 uint32_t  meshletCount;
                 uint32_t  cullEnabled;
                 uint32_t  frustumEnabled;
-                uint32_t  _pad1;
+                uint32_t  prevDepthEnabled;
+                glm::vec4 prevDepthParams;
             };
             SkinCullLdsPC lpc{};
             lpc.mvp[0]       = mvp0;
@@ -2251,8 +2701,25 @@ static void RenderStereo(App& app, uint32_t imageIdx,
             lpc.meshletCount = app.vk.meshletCount;
             lpc.cullEnabled  = 1u;
             lpc.frustumEnabled = (uint32_t)app.mode7Frustum;
+            lpc.prevDepthEnabled = app.prevDepthValid ? 1u : 0u;
+            lpc.prevDepthParams = glm::vec4((float)swapW, (float)swapH, 0.0025f, 0.0f);
             vkCmdPushConstants(cmd, app.vk.skinCullLdsPipelineLayout,
                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lpc), &lpc);
+            if (app.prevDepthValid) {
+                VkImageMemoryBarrier prevDepthToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                prevDepthToRead.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                prevDepthToRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                prevDepthToRead.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                prevDepthToRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                prevDepthToRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                prevDepthToRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                prevDepthToRead.image = app.xr.swapchains[0].prevDepthImages[prevDepthReadIdx];
+                prevDepthToRead.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0, 0, nullptr, 0, nullptr, 1, &prevDepthToRead);
+            }
             vkCmdDispatch(cmd, app.vk.meshletCount, 1, 1);
         } else if (useSkinCull) {
             // ---- mode=6: LBS + backface cull を 1 CS に融合 ----
@@ -2390,14 +2857,22 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     VkClearValue clears[2];
     clears[0].color        = {0.1f, 0.1f, 0.15f, 1.0f};
     clears[1].depthStencil = {1.0f, 0};
+    VkClearValue prevDepthClear{};
+    prevDepthClear.color.float32[0] = 1.0f;
+    VkClearValue motionClear{};
+    motionClear.color.float32[0] = 0.0f;
+    motionClear.color.float32[1] = 0.0f;
+    motionClear.color.float32[2] = 0.0f;
+    motionClear.color.float32[3] = 0.0f;
+    VkClearValue clears4[4] = {clears[0], clears[1], prevDepthClear, motionClear};
 
     VkRenderPassBeginInfo rpBI{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rpBI.renderPass        = app.vk.renderPass;
     rpBI.framebuffer       = fb;
     rpBI.renderArea.offset = {0, 0};
     rpBI.renderArea.extent = {swapW, swapH};
-    rpBI.clearValueCount   = 2;
-    rpBI.pClearValues      = clears;
+    rpBI.clearValueCount   = 4;
+    rpBI.pClearValues      = clears4;
 
     vkCmdBeginRenderPass(cmd, &rpBI, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -2454,6 +2929,121 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     if (app.vk.queryPool != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             app.vk.queryPool, TS_GFX_END);
+    }
+
+    VkImageMemoryBarrier downsampleSrcBarriers[2]{};
+    for (uint32_t i = 0; i < 2; ++i) {
+        downsampleSrcBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        downsampleSrcBarriers[i].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        downsampleSrcBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        downsampleSrcBarriers[i].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        downsampleSrcBarriers[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        downsampleSrcBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        downsampleSrcBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        downsampleSrcBarriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+    }
+    downsampleSrcBarriers[0].image = app.xr.swapchains[0].prevDepthImages[prevDepthWriteIdx];
+    downsampleSrcBarriers[1].image = app.xr.swapchains[0].motionImages[prevDepthWriteIdx];
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 2, downsampleSrcBarriers);
+
+    if (app.vk.queryPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            app.vk.queryPool, TS_DOWNSAMPLE_BEGIN);
+    }
+
+    struct HiZSpdPC {
+        uint32_t mips;
+        uint32_t numWorkGroups;
+        uint32_t srcWidth;
+        uint32_t srcHeight;
+    } spdPc{};
+    const uint32_t spdDispatchX = (app.xr.swapchains[0].width + 63u) / 64u;
+    const uint32_t spdDispatchY = (app.xr.swapchains[0].height + 63u) / 64u;
+    spdPc.mips = app.xr.swapchains[0].hiZMipCount;
+    spdPc.numWorkGroups = spdDispatchX * spdDispatchY;
+    spdPc.srcWidth = app.xr.swapchains[0].width;
+    spdPc.srcHeight = app.xr.swapchains[0].height;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.hiZSpdPipeline);
+    VkDescriptorSet hiZSpdDs = app.vk.hiZSpdDescSets[prevDepthWriteIdx];
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            app.vk.hiZSpdPipelineLayout, 0, 1, &hiZSpdDs, 0, nullptr);
+    vkCmdPushConstants(cmd, app.vk.hiZSpdPipelineLayout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(spdPc), &spdPc);
+    vkCmdDispatch(cmd, spdDispatchX, spdDispatchY, 2u);
+
+    VkImageMemoryBarrier hiZBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    hiZBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    hiZBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    hiZBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    hiZBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    hiZBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hiZBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hiZBarrier.image = app.xr.swapchains[0].hiZImages[prevDepthWriteIdx];
+    hiZBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, app.xr.swapchains[0].hiZMipCount, 0, 2};
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &hiZBarrier);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.hiZDownsamplePipeline);
+    struct DownsamplePC {
+        uint32_t dstWidth;
+        uint32_t dstHeight;
+        uint32_t validEyeCount;
+        uint32_t _pad0;
+    } dpc{};
+    dpc.validEyeCount = 2u;
+    for (uint32_t level = 0; level < app.xr.swapchains[0].hiZMipCount; ++level) {
+        VkDescriptorSet ds = app.vk.hiZDownsampleDescSets[prevDepthWriteIdx][level];
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                app.vk.hiZDownsamplePipelineLayout, 0, 1, &ds, 0, nullptr);
+        dpc.dstWidth = std::max(1u, (app.xr.swapchains[0].hiZW + ((1u << level) - 1u)) >> level);
+        dpc.dstHeight = std::max(1u, (app.xr.swapchains[0].hiZH + ((1u << level) - 1u)) >> level);
+        vkCmdPushConstants(cmd, app.vk.hiZDownsamplePipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dpc), &dpc);
+        vkCmdDispatch(cmd, (dpc.dstWidth + 7u) / 8u, (dpc.dstHeight + 7u) / 8u, dpc.validEyeCount);
+
+        VkImageMemoryBarrier levelBarriers[1]{};
+        levelBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        levelBarriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        levelBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        levelBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        levelBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        levelBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        levelBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        levelBarriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, 0, 2};
+        levelBarriers[0].image = app.xr.swapchains[0].motionHalfImages[prevDepthWriteIdx];
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, levelBarriers);
+    }
+
+    VkImageMemoryBarrier downsampleDstBarriers[2]{};
+    for (uint32_t i = 0; i < 2; ++i) {
+        downsampleDstBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        downsampleDstBarriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        downsampleDstBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        downsampleDstBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        downsampleDstBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        downsampleDstBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        downsampleDstBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        downsampleDstBarriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, app.xr.swapchains[0].hiZMipCount, 0, 2};
+    }
+    downsampleDstBarriers[0].image = app.xr.swapchains[0].hiZImages[prevDepthWriteIdx];
+    downsampleDstBarriers[1].image = app.xr.swapchains[0].motionHalfImages[prevDepthWriteIdx];
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 2, downsampleDstBarriers);
+
+    if (app.vk.queryPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            app.vk.queryPool, TS_DOWNSAMPLE_END);
     }
 
     CHECK_VK(vkEndCommandBuffer(cmd));
@@ -2533,6 +3123,7 @@ static void RenderFrame(App& app) {
                 double nsPerTick = (double)app.vk.timestampPeriod;
                 app.lastCsMs  = (ts[TS_CS_END]  - ts[TS_CS_BEGIN])  * nsPerTick * 1e-6;
                 app.lastGfxMs = (ts[TS_GFX_END] - ts[TS_GFX_BEGIN]) * nsPerTick * 1e-6;
+                app.lastDownsampleMs = (ts[TS_DOWNSAMPLE_END] - ts[TS_DOWNSAMPLE_BEGIN]) * nsPerTick * 1e-6;
             }
         }
 
@@ -2558,6 +3149,8 @@ static void RenderFrame(App& app) {
         si.commandBufferCount = 1;
         si.pCommandBuffers    = &app.vk.cmdBuffers[imgIdx];
         CHECK_VK(vkQueueSubmit(app.vk.queue, 1, &si, app.vk.fence));
+        app.prevDepthValid = true;
+        app.frameParity ^= 1u;
 
         // スワップチェーン画像を解放
         XrSwapchainImageReleaseInfo relInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -2592,18 +3185,18 @@ static void RenderFrame(App& app) {
             uint32_t liveTris = app.lastBfIndexCount / 3;
             float    ratio    = app.vk.triangleCount > 0
                                 ? (float)liveTris / (float)app.vk.triangleCount : 0.f;
-            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  Polys=%d  LiveTris=%u/%u (%.1f%%)  mode=%d",
-                 fps, avgMs, app.lastCsMs, app.lastGfxMs,
+            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  DS=%.3fms  Polys=%d  LiveTris=%u/%u (%.1f%%)  mode=%d",
+                 fps, avgMs, app.lastCsMs, app.lastGfxMs, app.lastDownsampleMs,
                  polysTotal, liveTris, app.vk.triangleCount, ratio * 100.f, app.cullMode);
         } else if (app.cullMode == 8) {
-            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  Polys=%d  DrawCalls=%d  mode=8(compact u16)",
-                 fps, avgMs, app.lastCsMs, app.lastGfxMs, polysTotal, app.vk.cubeCountStored);
+            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  DS=%.3fms  Polys=%d  DrawCalls=%d  mode=8(compact u16)",
+                 fps, avgMs, app.lastCsMs, app.lastGfxMs, app.lastDownsampleMs, polysTotal, app.vk.cubeCountStored);
         } else if (app.cullMode == 4) {
-            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  Polys=%d  DrawCalls=%d  mode=4(draw-only u16)",
-                 fps, avgMs, app.lastCsMs, app.lastGfxMs, polysTotal, app.vk.cubeCountStored);
+            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  DS=%.3fms  Polys=%d  DrawCalls=%d  mode=4(draw-only u16)",
+                 fps, avgMs, app.lastCsMs, app.lastGfxMs, app.lastDownsampleMs, polysTotal, app.vk.cubeCountStored);
         } else {
-            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  Polys=%d  Meshlets=%u/%u  mode=%d",
-                 fps, avgMs, app.lastCsMs, app.lastGfxMs,
+            LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  DS=%.3fms  Polys=%d  Meshlets=%u/%u  mode=%d",
+                 fps, avgMs, app.lastCsMs, app.lastGfxMs, app.lastDownsampleMs,
                  polysTotal, app.lastVisibleCount, app.vk.meshletCount, app.cullMode);
         }
         app.frameMsAccum = 0.0;
@@ -2738,6 +3331,17 @@ static void Cleanup(App& app) {
         if (app.vk.skinCullLdsPipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.skinCullLdsPipelineLayout, nullptr);
         if (app.vk.skinCullLdsDescPool)        vkDestroyDescriptorPool(app.vk.device, app.vk.skinCullLdsDescPool, nullptr);
         if (app.vk.skinCullLdsDescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.skinCullLdsDescLayout, nullptr);
+        if (app.vk.prevDepthSampler)           vkDestroySampler(app.vk.device, app.vk.prevDepthSampler, nullptr);
+        if (app.vk.hiZSpdPipeline)             vkDestroyPipeline(app.vk.device, app.vk.hiZSpdPipeline, nullptr);
+        if (app.vk.hiZSpdPipelineLayout)       vkDestroyPipelineLayout(app.vk.device, app.vk.hiZSpdPipelineLayout, nullptr);
+        if (app.vk.hiZSpdDescPool)             vkDestroyDescriptorPool(app.vk.device, app.vk.hiZSpdDescPool, nullptr);
+        if (app.vk.hiZSpdDescLayout)           vkDestroyDescriptorSetLayout(app.vk.device, app.vk.hiZSpdDescLayout, nullptr);
+        if (app.vk.hiZSpdAtomicBuffer)         vkDestroyBuffer(app.vk.device, app.vk.hiZSpdAtomicBuffer, nullptr);
+        if (app.vk.hiZSpdAtomicMemory)         vkFreeMemory(app.vk.device, app.vk.hiZSpdAtomicMemory, nullptr);
+        if (app.vk.hiZDownsamplePipeline)        vkDestroyPipeline(app.vk.device, app.vk.hiZDownsamplePipeline, nullptr);
+        if (app.vk.hiZDownsamplePipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.hiZDownsamplePipelineLayout, nullptr);
+        if (app.vk.hiZDownsampleDescPool)        vkDestroyDescriptorPool(app.vk.device, app.vk.hiZDownsampleDescPool, nullptr);
+        if (app.vk.hiZDownsampleDescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.hiZDownsampleDescLayout, nullptr);
         if (app.vk.skinCullLdsU16Pipeline)        vkDestroyPipeline(app.vk.device, app.vk.skinCullLdsU16Pipeline, nullptr);
         if (app.vk.skinCullLdsU16PipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.skinCullLdsU16PipelineLayout, nullptr);
         if (app.vk.skinCullLdsU16DescPool)        vkDestroyDescriptorPool(app.vk.device, app.vk.skinCullLdsU16DescPool, nullptr);
@@ -2745,8 +3349,28 @@ static void Cleanup(App& app) {
 
         for (auto& sc : app.xr.swapchains) {
             for (auto& si : sc.images) {
-                if (si.framebuffer) vkDestroyFramebuffer(app.vk.device, si.framebuffer, nullptr);
+                for (VkFramebuffer fb : si.framebuffers) {
+                    if (fb) vkDestroyFramebuffer(app.vk.device, fb, nullptr);
+                }
                 if (si.view)        vkDestroyImageView(app.vk.device, si.view, nullptr);
+            }
+            for (uint32_t ping = 0; ping < 2; ++ping) {
+                if (sc.prevDepthViews[ping])   vkDestroyImageView(app.vk.device, sc.prevDepthViews[ping], nullptr);
+                if (sc.prevDepthImages[ping])  vkDestroyImage(app.vk.device, sc.prevDepthImages[ping], nullptr);
+                if (sc.prevDepthMemories[ping]) vkFreeMemory(app.vk.device, sc.prevDepthMemories[ping], nullptr);
+                if (sc.motionViews[ping])      vkDestroyImageView(app.vk.device, sc.motionViews[ping], nullptr);
+                if (sc.motionImages[ping])     vkDestroyImage(app.vk.device, sc.motionImages[ping], nullptr);
+                if (sc.motionMemories[ping])   vkFreeMemory(app.vk.device, sc.motionMemories[ping], nullptr);
+                for (VkImageView v : sc.hiZMipViews[ping]) {
+                    if (v) vkDestroyImageView(app.vk.device, v, nullptr);
+                }
+                if (sc.hiZImages[ping])        vkDestroyImage(app.vk.device, sc.hiZImages[ping], nullptr);
+                if (sc.hiZMemories[ping])      vkFreeMemory(app.vk.device, sc.hiZMemories[ping], nullptr);
+                for (VkImageView v : sc.motionHalfMipViews[ping]) {
+                    if (v) vkDestroyImageView(app.vk.device, v, nullptr);
+                }
+                if (sc.motionHalfImages[ping]) vkDestroyImage(app.vk.device, sc.motionHalfImages[ping], nullptr);
+                if (sc.motionHalfMemories[ping]) vkFreeMemory(app.vk.device, sc.motionHalfMemories[ping], nullptr);
             }
             if (sc.depthView)   vkDestroyImageView(app.vk.device, sc.depthView, nullptr);
             if (sc.depthImage)  vkDestroyImage(app.vk.device, sc.depthImage, nullptr);
