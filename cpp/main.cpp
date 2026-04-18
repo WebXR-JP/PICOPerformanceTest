@@ -9,6 +9,8 @@
  * フレームタイム（ms）と頂点数を毎秒 logcat に出力する。
  */
 
+#define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
+
 #include <android/log.h>
 #include <android_native_app_glue.h>
 #include <jni.h>
@@ -16,31 +18,34 @@
 // Vulkan は openxr_platform.h より前にインクルードする必要がある
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_android.h>
+#include <vulkan/vulkan.hpp>
+#include <vulkan/vulkan_raii.hpp>
 
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
-// VMA (Vulkan Memory Allocator) - 単一ヘッダ実装をここに展開
-// Android libvulkan.so は Vulkan 1.1+ 関数を静的エクスポートしないため、
-// vkGetInstanceProcAddr 経由で動的に解決する
 #define VMA_IMPLEMENTATION
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
-#define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
+#define VMA_DYNAMIC_VULKAN_FUNCTIONS 0
 #define VMA_VULKAN_VERSION 1001000
-#include "vk_mem_alloc.h"
+#include "vk_mem_alloc.hpp"
+#include "vk_mem_alloc_raii.hpp"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <algorithm>
 #include <string>
 #include <vector>
+
+VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 // 生成したシェーダーヘッダー（ビルド時に cmake/embed_spirv.cmake が生成）
 #include "vertex_vs_skin_spv.h"
@@ -66,30 +71,31 @@
 #endif
 
 // ---- CHECK マクロ ----
-#define CHECK_XR(expr)                                                     \
-    do {                                                                   \
-        XrResult _r = (expr);                                              \
-        if (XR_FAILED(_r)) {                                               \
-            LOGE("XR error %d at %s:%d", (int)_r, __FILE__, __LINE__);    \
-            assert(false);                                                 \
-        }                                                                  \
-    } while (0)
+#define CHECK_XR(expr)                                                         do {                                                                           XrResult _r = (expr);                                                      if (XR_FAILED(_r)) {                                                           LOGE("XR error %d at %s:%d", (int)_r, __FILE__, __LINE__);                assert(false);                                                         }                                                                      } while (0)
 
-#define CHECK_VK(expr)                                                     \
-    do {                                                                   \
-        VkResult _r = (expr);                                              \
-        if (_r != VK_SUCCESS) {                                            \
-            LOGE("VK error %d at %s:%d", (int)_r, __FILE__, __LINE__);    \
-            assert(false);                                                 \
-        }                                                                  \
-    } while (0)
+static void CheckVkResult(VkResult result) {
+    if (result != VK_SUCCESS) {
+        LOGE("VK error %d", static_cast<int>(result));
+        assert(false);
+    }
+}
+
+template <typename Handle>
+static auto Raw(const Handle& handle) -> typename Handle::CType {
+    return static_cast<typename Handle::CType>(*handle);
+}
+
+template <typename Handle>
+static bool IsValid(const Handle& handle) {
+    return Raw(handle) != typename Handle::CType{};
+}
 
 // ============================================================
 // Vulkan コンテキスト
 // ============================================================
 struct SwapchainImage {
-    VkImage     image;
-    VkImageView view;
+    VkImage           image = VK_NULL_HANDLE;
+    vk::raii::ImageView view{nullptr};
 };
 
 struct EyeSwapchain {
@@ -98,86 +104,75 @@ struct EyeSwapchain {
     uint32_t    height = 0;
     std::vector<SwapchainImage> images;
     // デプスバッファ（全画像で共有）
-    VkImage        depthImage  = VK_NULL_HANDLE;
-    VmaAllocation  depthAlloc  = VK_NULL_HANDLE;
-    VkImageView    depthView   = VK_NULL_HANDLE;
-    VkImageView    depthSampleView = VK_NULL_HANDLE;
-    VkImage        prevDepthImages[2]  = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VmaAllocation  prevDepthAllocs[2]  = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkImageView    prevDepthViews[2]   = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkImage        motionImages[2]     = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VmaAllocation  motionAllocs[2]     = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkImageView    motionViews[2]      = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkImage        hiZImages[2]        = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VmaAllocation  hiZAllocs[2]        = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkImageView    hiZViews[2]         = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    std::vector<VkImageView> hiZMipViews[2];
-    uint32_t       hiZW                = 0;
-    uint32_t       hiZH                = 0;
-    uint32_t       hiZMipCount         = 0;
+    vma::raii::Image                     depthImage{nullptr};
+    vk::raii::ImageView                  depthView{nullptr};
+    vk::raii::ImageView                  depthSampleView{nullptr};
+    std::array<vma::raii::Image, 2>      prevDepthImages{nullptr, nullptr};
+    std::array<vk::raii::ImageView, 2>   prevDepthViews{nullptr, nullptr};
+    std::array<vma::raii::Image, 2>      motionImages{nullptr, nullptr};
+    std::array<vk::raii::ImageView, 2>   motionViews{nullptr, nullptr};
+    std::array<vma::raii::Image, 2>      hiZImages{nullptr, nullptr};
+    std::array<vk::raii::ImageView, 2>   hiZViews{nullptr, nullptr};
+    std::array<std::vector<vk::raii::ImageView>, 2> hiZMipViews;
+    uint32_t                             hiZW        = 0;
+    uint32_t                             hiZH        = 0;
+    uint32_t                             hiZMipCount = 0;
 };
 
 struct VulkanCtx {
-    VkInstance       instance       = VK_NULL_HANDLE;
-    VkPhysicalDevice physDevice     = VK_NULL_HANDLE;
-    VkDevice         device         = VK_NULL_HANDLE;
-    uint32_t         queueFamily    = 0;
-    VkQueue          queue          = VK_NULL_HANDLE;
-    VkCommandPool    cmdPool        = VK_NULL_HANDLE;
-    VmaAllocator     allocator      = VK_NULL_HANDLE;
-    VkFormat         colorFormat    = VK_FORMAT_UNDEFINED;
-    VkBuffer         vertexBuffer   = VK_NULL_HANDLE;
-    VmaAllocation    vertexAlloc    = VK_NULL_HANDLE;
-    VkBuffer         indexBuffer    = VK_NULL_HANDLE;
-    VmaAllocation    indexAlloc     = VK_NULL_HANDLE;
-    uint32_t         indexCount     = 0;
-    uint32_t         vertexCount    = 0;
-    VkFence          fence          = VK_NULL_HANDLE;
+    vk::raii::Context                       context;
+    vk::raii::Instance                      instance{nullptr};
+    vk::raii::PhysicalDevice                physDevice{nullptr};
+    vk::raii::Device                        device{nullptr};
+    uint32_t                                queueFamily = 0;
+    vk::raii::Queue                         queue{nullptr};
+    vk::raii::CommandPool                   cmdPool{nullptr};
+    vma::raii::Allocator                    allocator{nullptr};
+    VkFormat                                colorFormat = VK_FORMAT_UNDEFINED;
+    vma::raii::Buffer                       vertexBuffer{nullptr};
+    vma::raii::Buffer                       indexBuffer{nullptr};
+    uint32_t                                indexCount  = 0;
+    uint32_t                                vertexCount = 0;
+    vk::raii::Fence                         fence{nullptr};
     // コマンドバッファ（スワップチェーン画像数、multiview で両目を1回で描画）
-    std::vector<VkCommandBuffer> cmdBuffers; // [imageIdx]
+    vk::raii::CommandBuffers                cmdBuffers{nullptr}; // [imageIdx]
 
     // ---- Meshlet Buffer ----
-    VkBuffer              meshletBuffer        = VK_NULL_HANDLE;
-    VmaAllocation         meshletAlloc         = VK_NULL_HANDLE;
-    uint32_t              meshletCount         = 0;
+    vma::raii::Buffer                       meshletBuffer{nullptr};
+    uint32_t                                meshletCount = 0;
 
     // ---- Timestamp Query ----
-    VkQueryPool           queryPool              = VK_NULL_HANDLE;
-    float                 timestampPeriod        = 1.f; // ns/tick
+    vk::raii::QueryPool                     queryPool{nullptr};
+    float                                   timestampPeriod = 1.f; // ns/tick
 
     // ---- Per-triangle Backface Culling (Compute) ----
-    VkBuffer              compactIndexBuffer     = VK_NULL_HANDLE;
-    VmaAllocation         compactIndexAlloc      = VK_NULL_HANDLE;
-    VkBuffer              bfDrawCmdBuffer        = VK_NULL_HANDLE;
-    VmaAllocation         bfDrawCmdAlloc         = VK_NULL_HANDLE;
-    VkBuffer              cullStatsBuffer        = VK_NULL_HANDLE;
-    VmaAllocation         cullStatsAlloc         = VK_NULL_HANDLE;
+    vma::raii::Buffer                       compactIndexBuffer{nullptr};
+    vma::raii::Buffer                       bfDrawCmdBuffer{nullptr};
+    vma::raii::Buffer                       cullStatsBuffer{nullptr};
 
     // ---- Skinning ----
-    VkBuffer              boneBuffer             = VK_NULL_HANDLE;
-    VmaAllocation         boneAlloc              = VK_NULL_HANDLE;
-    uint32_t              totalBones             = 0;
+    vma::raii::Buffer                       boneBuffer{nullptr};
+    uint32_t                                totalBones = 0;
     std::vector<glm::vec3> bonePivots;            // world 空間のボーン原点（回転軸）
 
     // ---- mode=5: VS-inline skinning（CS posF16 書き出しなし）----
-    VkDescriptorSetLayout vsSkinDescLayout      = VK_NULL_HANDLE;
-    VkPipelineLayout      vsSkinPipelineLayout  = VK_NULL_HANDLE;
-    VkPipeline            vsSkinPipeline        = VK_NULL_HANDLE;
+    vk::raii::DescriptorSetLayout           vsSkinDescLayout{nullptr};
+    vk::raii::PipelineLayout                vsSkinPipelineLayout{nullptr};
+    vk::raii::Pipeline                      vsSkinPipeline{nullptr};
 
     // ---- mode=7: CS LDS skin+cull（1 workgroup = 1 meshlet）----
-    VkDescriptorSetLayout skinCullLdsDescLayout    = VK_NULL_HANDLE;
-    VkPipelineLayout      skinCullLdsPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline            skinCullLdsPipeline      = VK_NULL_HANDLE;
-    VkSampler             prevDepthSampler         = VK_NULL_HANDLE;
-    VkSampler             hiZSampler               = VK_NULL_HANDLE;
-    VkBuffer              hiZSpdAtomicBuffer       = VK_NULL_HANDLE;
-    VmaAllocation         hiZSpdAtomicAlloc        = VK_NULL_HANDLE;
-    VkDescriptorSetLayout hiZSpdDescLayout         = VK_NULL_HANDLE;
-    VkPipelineLayout      hiZSpdPipelineLayout     = VK_NULL_HANDLE;
-    VkPipeline            hiZSpdPipeline           = VK_NULL_HANDLE;
-    VkDescriptorSetLayout meshletDebugDescLayout   = VK_NULL_HANDLE;
-    VkPipelineLayout      meshletDebugPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline            meshletDebugPipeline     = VK_NULL_HANDLE;
+    vk::raii::DescriptorSetLayout           skinCullLdsDescLayout{nullptr};
+    vk::raii::PipelineLayout                skinCullLdsPipelineLayout{nullptr};
+    vk::raii::Pipeline                      skinCullLdsPipeline{nullptr};
+    vk::raii::Sampler                       prevDepthSampler{nullptr};
+    vk::raii::Sampler                       hiZSampler{nullptr};
+    vma::raii::Buffer                       hiZSpdAtomicBuffer{nullptr};
+    vk::raii::DescriptorSetLayout           hiZSpdDescLayout{nullptr};
+    vk::raii::PipelineLayout                hiZSpdPipelineLayout{nullptr};
+    vk::raii::Pipeline                      hiZSpdPipeline{nullptr};
+    vk::raii::DescriptorSetLayout           meshletDebugDescLayout{nullptr};
+    vk::raii::PipelineLayout                meshletDebugPipelineLayout{nullptr};
+    vk::raii::Pipeline                      meshletDebugPipeline{nullptr};
 };
 
 // timestamp index 定数
@@ -213,20 +208,17 @@ static PFN_xrCreateVulkanInstanceKHR            pfn_xrCreateVulkanInstanceKHR   
 static PFN_xrGetVulkanGraphicsDevice2KHR        pfn_xrGetVulkanGraphicsDevice2KHR       = nullptr;
 static PFN_xrCreateVulkanDeviceKHR              pfn_xrCreateVulkanDeviceKHR             = nullptr;
 
-// ============================================================
-// Vulkan 拡張関数ポインタ
-// ============================================================
-static PFN_vkCmdBeginRenderingKHR      pfn_vkCmdBeginRenderingKHR      = nullptr;
-static PFN_vkCmdEndRenderingKHR        pfn_vkCmdEndRenderingKHR        = nullptr;
-static PFN_vkCmdPipelineBarrier2KHR    pfn_vkCmdPipelineBarrier2KHR    = nullptr;
-static PFN_vkCmdWriteTimestamp2KHR     pfn_vkCmdWriteTimestamp2KHR     = nullptr;
-static PFN_vkCmdPushDescriptorSetKHR   pfn_vkCmdPushDescriptorSetKHR   = nullptr;
+static PFN_vkCmdBeginRenderingKHR    pfn_vkCmdBeginRenderingKHR    = nullptr;
+static PFN_vkCmdEndRenderingKHR      pfn_vkCmdEndRenderingKHR      = nullptr;
+static PFN_vkCmdPipelineBarrier2KHR  pfn_vkCmdPipelineBarrier2KHR  = nullptr;
+static PFN_vkCmdWriteTimestamp2KHR   pfn_vkCmdWriteTimestamp2KHR   = nullptr;
+static PFN_vkCmdPushDescriptorSetKHR pfn_vkCmdPushDescriptorSetKHR = nullptr;
 
-#define vkCmdBeginRenderingKHR      pfn_vkCmdBeginRenderingKHR
-#define vkCmdEndRenderingKHR        pfn_vkCmdEndRenderingKHR
-#define vkCmdPipelineBarrier2KHR    pfn_vkCmdPipelineBarrier2KHR
-#define vkCmdWriteTimestamp2KHR     pfn_vkCmdWriteTimestamp2KHR
-#define vkCmdPushDescriptorSetKHR   pfn_vkCmdPushDescriptorSetKHR
+#define vkCmdBeginRenderingKHR    pfn_vkCmdBeginRenderingKHR
+#define vkCmdEndRenderingKHR      pfn_vkCmdEndRenderingKHR
+#define vkCmdPipelineBarrier2KHR  pfn_vkCmdPipelineBarrier2KHR
+#define vkCmdWriteTimestamp2KHR   pfn_vkCmdWriteTimestamp2KHR
+#define vkCmdPushDescriptorSetKHR pfn_vkCmdPushDescriptorSetKHR
 
 static void LoadXrExtFunctions(XrInstance instance) {
     CHECK_XR(xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsRequirements2KHR",
@@ -245,102 +237,92 @@ static void LoadXrExtFunctions(XrInstance instance) {
 static void CreateBuffer(VulkanCtx& vk, VkDeviceSize size,
                          VkBufferUsageFlags usage,
                          VkMemoryPropertyFlags memProps,
-                         VkBuffer& buffer, VmaAllocation& alloc) {
-    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                         vma::raii::Buffer& buffer) {
+    vk::BufferCreateInfo bi{};
     bi.size        = size;
-    bi.usage       = usage;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    bi.usage       = static_cast<vk::BufferUsageFlags>(usage);
+    bi.sharingMode = vk::SharingMode::eExclusive;
 
-    VmaAllocationCreateInfo aci{};
-    aci.usage         = VMA_MEMORY_USAGE_UNKNOWN;
-    aci.requiredFlags = memProps;
+    vma::AllocationCreateInfo aci{};
+    aci.usage         = vma::MemoryUsage::eUnknown;
+    aci.requiredFlags = static_cast<vk::MemoryPropertyFlags>(memProps);
     if (memProps & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
-        aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT
-                  | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+        aci.flags = vma::AllocationCreateFlagBits::eMapped
+                  | vma::AllocationCreateFlagBits::eHostAccessRandom;
     }
-    CHECK_VK(vmaCreateBuffer(vk.allocator, &bi, &aci, &buffer, &alloc, nullptr));
+    buffer = vma::raii::Buffer(vk.allocator, bi, aci);
 }
 
-static void UploadBufferData(VulkanCtx& vk, VkBuffer dstBuffer, const void* srcData, VkDeviceSize size) {
-    VkBuffer stagingBuffer = VK_NULL_HANDLE;
-    VmaAllocation stagingAlloc = VK_NULL_HANDLE;
-    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bi.size = size;
-    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VmaAllocationCreateInfo aci{};
-    aci.usage = VMA_MEMORY_USAGE_AUTO;
-    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-              | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    VmaAllocationInfo stagingInfo{};
-    CHECK_VK(vmaCreateBuffer(vk.allocator, &bi, &aci, &stagingBuffer, &stagingAlloc, &stagingInfo));
+static void UploadBufferData(VulkanCtx& vk, const vma::raii::Buffer& dstBuffer, const void* srcData, VkDeviceSize size) {
+    vk::BufferCreateInfo bi{};
+    bi.size        = size;
+    bi.usage       = vk::BufferUsageFlagBits::eTransferSrc;
+    bi.sharingMode = vk::SharingMode::eExclusive;
 
-    memcpy(stagingInfo.pMappedData, srcData, (size_t)size);
+    vma::AllocationCreateInfo aci{};
+    aci.usage = vma::MemoryUsage::eAuto;
+    aci.flags = vma::AllocationCreateFlagBits::eHostAccessSequentialWrite
+              | vma::AllocationCreateFlagBits::eMapped;
+    vma::raii::Buffer stagingBuffer(vk.allocator, bi, aci);
+    void* mapped = stagingBuffer.getAllocation().map();
+    std::memcpy(mapped, srcData, (size_t)size);
+    stagingBuffer.getAllocation().unmap();
 
-    VkCommandBufferAllocateInfo cbAI{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbAI.commandPool = vk.cmdPool;
-    cbAI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbAI.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    CHECK_VK(vkAllocateCommandBuffers(vk.device, &cbAI, &cmd));
+    auto cmdBuffers = vk.device.allocateCommandBuffers(
+        vk::CommandBufferAllocateInfo(Raw(vk.cmdPool), vk::CommandBufferLevel::ePrimary, 1));
+    auto& cmd = cmdBuffers.front();
 
-    VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    CHECK_VK(vkBeginCommandBuffer(cmd, &cbi));
-    VkBufferCopy region{0, 0, size};
-    vkCmdCopyBuffer(cmd, stagingBuffer, dstBuffer, 1, &region);
-    CHECK_VK(vkEndCommandBuffer(cmd));
+    cmd.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+    cmd.copyBuffer(Raw(stagingBuffer), Raw(dstBuffer), vk::BufferCopy(0, 0, size));
+    cmd.end();
 
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    CHECK_VK(vkQueueSubmit(vk.queue, 1, &si, VK_NULL_HANDLE));
-    CHECK_VK(vkQueueWaitIdle(vk.queue));
-
-    vkFreeCommandBuffers(vk.device, vk.cmdPool, 1, &cmd);
-    vmaDestroyBuffer(vk.allocator, stagingBuffer, stagingAlloc);
+    vk::CommandBuffer submitCmd = Raw(cmd);
+    vk::SubmitInfo submitInfo{};
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &submitCmd;
+    vk.queue.submit(submitInfo, nullptr);
+    vk.queue.waitIdle();
 }
 
 static void CreateImage(VulkanCtx& vk, uint32_t w, uint32_t h,
                         VkFormat format, VkImageUsageFlags usage,
-                        VkImage& image, VmaAllocation& alloc,
+                        vma::raii::Image& image,
                         uint32_t arrayLayers = 1,
                         uint32_t mipLevels = 1) {
-    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ci.imageType   = VK_IMAGE_TYPE_2D;
-    ci.format      = format;
-    ci.extent      = {w, h, 1};
-    ci.mipLevels   = mipLevels;
-    ci.arrayLayers = arrayLayers;
-    ci.samples     = VK_SAMPLE_COUNT_1_BIT;
-    ci.tiling      = VK_IMAGE_TILING_OPTIMAL;
-    ci.usage       = usage;
-    ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    vk::ImageCreateInfo ci{};
+    ci.imageType     = vk::ImageType::e2D;
+    ci.format        = static_cast<vk::Format>(format);
+    ci.extent        = vk::Extent3D(w, h, 1);
+    ci.mipLevels     = mipLevels;
+    ci.arrayLayers   = arrayLayers;
+    ci.samples       = vk::SampleCountFlagBits::e1;
+    ci.tiling        = vk::ImageTiling::eOptimal;
+    ci.usage         = static_cast<vk::ImageUsageFlags>(usage);
+    ci.sharingMode   = vk::SharingMode::eExclusive;
+    ci.initialLayout = vk::ImageLayout::eUndefined;
 
-    VmaAllocationCreateInfo aci{};
-    aci.usage         = VMA_MEMORY_USAGE_UNKNOWN;
-    aci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    CHECK_VK(vmaCreateImage(vk.allocator, &ci, &aci, &image, &alloc, nullptr));
+    vma::AllocationCreateInfo aci{};
+    aci.usage         = vma::MemoryUsage::eUnknown;
+    aci.requiredFlags = vk::MemoryPropertyFlagBits::eDeviceLocal;
+    image = vma::raii::Image(vk.allocator, ci, aci);
 }
 
-static VkImageView CreateImageView(VulkanCtx& vk,
-                                   VkImage image,
-                                   VkFormat format,
-                                   VkImageAspectFlags aspectMask,
-                                   VkImageViewType viewType,
-                                   uint32_t baseMipLevel,
-                                   uint32_t levelCount,
-                                   uint32_t baseArrayLayer,
-                                   uint32_t layerCount) {
-    VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+static vk::raii::ImageView CreateImageView(VulkanCtx& vk,
+                                           VkImage image,
+                                           VkFormat format,
+                                           VkImageAspectFlags aspectMask,
+                                           VkImageViewType viewType,
+                                           uint32_t baseMipLevel,
+                                           uint32_t levelCount,
+                                           uint32_t baseArrayLayer,
+                                           uint32_t layerCount) {
+    vk::ImageViewCreateInfo ci{};
     ci.image = image;
-    ci.viewType = viewType;
-    ci.format = format;
-    ci.subresourceRange = {aspectMask, baseMipLevel, levelCount, baseArrayLayer, layerCount};
-    VkImageView view = VK_NULL_HANDLE;
-    CHECK_VK(vkCreateImageView(vk.device, &ci, nullptr, &view));
-    return view;
+    ci.viewType = static_cast<vk::ImageViewType>(viewType);
+    ci.format = static_cast<vk::Format>(format);
+    ci.subresourceRange = vk::ImageSubresourceRange(
+        static_cast<vk::ImageAspectFlags>(aspectMask), baseMipLevel, levelCount, baseArrayLayer, layerCount);
+    return vk::raii::ImageView(vk.device, ci);
 }
 
 static void TransitionImageLayoutNow(VulkanCtx& vk,
@@ -350,43 +332,36 @@ static void TransitionImageLayoutNow(VulkanCtx& vk,
                                      VkImageLayout newLayout,
                                      uint32_t layerCount = 1,
                                      uint32_t mipCount = 1) {
-    VkCommandBufferAllocateInfo cbAI{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbAI.commandPool = vk.cmdPool;
-    cbAI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbAI.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    CHECK_VK(vkAllocateCommandBuffers(vk.device, &cbAI, &cmd));
+    auto cmdBuffers = vk.device.allocateCommandBuffers(
+        vk::CommandBufferAllocateInfo(Raw(vk.cmdPool), vk::CommandBufferLevel::ePrimary, 1));
+    auto& cmd = cmdBuffers.front();
 
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    CHECK_VK(vkBeginCommandBuffer(cmd, &bi));
+    cmd.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
 
-    VkImageMemoryBarrier2KHR barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
-    barrier.srcStageMask        = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR;
-    barrier.srcAccessMask       = 0;
-    barrier.dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    vk::ImageMemoryBarrier2 barrier{};
+    barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTopOfPipe;
+    barrier.srcAccessMask       = {};
+    barrier.dstStageMask        = vk::PipelineStageFlagBits2::eComputeShader;
     barrier.dstAccessMask       = (newLayout == VK_IMAGE_LAYOUT_GENERAL)
-        ? (VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT_KHR)
-        : 0;
-    barrier.oldLayout           = oldLayout;
-    barrier.newLayout           = newLayout;
+        ? (vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite)
+        : vk::AccessFlags2{};
+    barrier.oldLayout           = static_cast<vk::ImageLayout>(oldLayout);
+    barrier.newLayout           = static_cast<vk::ImageLayout>(newLayout);
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image               = image;
-    barrier.subresourceRange    = {aspectMask, 0, mipCount, 0, layerCount};
+    barrier.subresourceRange    = vk::ImageSubresourceRange(
+        static_cast<vk::ImageAspectFlags>(aspectMask), 0, mipCount, 0, layerCount);
 
-    VkDependencyInfoKHR depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
-    depInfo.imageMemoryBarrierCount = 1;
-    depInfo.pImageMemoryBarriers    = &barrier;
-    vkCmdPipelineBarrier2KHR(cmd, &depInfo);
-    CHECK_VK(vkEndCommandBuffer(cmd));
+    cmd.pipelineBarrier2(vk::DependencyInfo({}, {}, {}, barrier));
+    cmd.end();
 
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    CHECK_VK(vkQueueSubmit(vk.queue, 1, &si, VK_NULL_HANDLE));
-    CHECK_VK(vkQueueWaitIdle(vk.queue));
-    vkFreeCommandBuffers(vk.device, vk.cmdPool, 1, &cmd);
+    vk::CommandBuffer submitCmd = Raw(cmd);
+    vk::SubmitInfo submitInfo{};
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &submitCmd;
+    vk.queue.submit(submitInfo, nullptr);
+    vk.queue.waitIdle();
 }
 
 // ============================================================
@@ -454,11 +429,10 @@ static void UpdateBones(VulkanCtx& vk, float time) {
         uint16_t* dst = boneData.data() + i * 16u;
         for (int k = 0; k < 16; k++) dst[k] = FloatToHalf(src[k]);
     }
-    void* p = nullptr;
+    void* p = vk.boneBuffer.getAllocation().map();
     VkDeviceSize bSize = sizeof(uint16_t) * 16u * N;
-    vmaMapMemory(vk.allocator, vk.boneAlloc, &p);
-    memcpy(p, boneData.data(), bSize);
-    vmaUnmapMemory(vk.allocator, vk.boneAlloc);
+    std::memcpy(p, boneData.data(), (size_t)bSize);
+    vk.boneBuffer.getAllocation().unmap();
 }
 
 static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
@@ -637,7 +611,7 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 vk.vertexBuffer, vk.vertexAlloc);
+                 vk.vertexBuffer);
     UploadBufferData(vk, vk.vertexBuffer, verts.data(), vSize);
 
     // インデックスバッファ（backface CS が読む、staging upload 後は DEVICE_LOCAL）
@@ -647,7 +621,7 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 vk.indexBuffer, vk.indexAlloc);
+                 vk.indexBuffer);
     UploadBufferData(vk, vk.indexBuffer, indices.data(), iSize);
 
     // ---- Meshlet SSBO（初期化時に staging upload して DEVICE_LOCAL 化）----
@@ -656,7 +630,7 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 vk.meshletBuffer, vk.meshletAlloc);
+                 vk.meshletBuffer);
     UploadBufferData(vk, vk.meshletBuffer, meshlets.data(), mSize);
 
     // ---- Per-triangle backface culling 用バッファ（mode=7 で使用）----
@@ -664,7 +638,7 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
     CreateBuffer(vk, iSize,
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 vk.compactIndexBuffer, vk.compactIndexAlloc);
+                 vk.compactIndexBuffer);
 
     // 単一の DrawCmd（indexCount は CS が atomicAdd で書く、他は固定）
     VkDeviceSize drawCmdSize = 5 * sizeof(uint32_t);
@@ -673,12 +647,12 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 vk.bfDrawCmdBuffer, vk.bfDrawCmdAlloc);
+                 vk.bfDrawCmdBuffer);
 
     CreateBuffer(vk, sizeof(uint32_t) * 4u,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 vk.cullStatsBuffer, vk.cullStatsAlloc);
+                 vk.cullStatsBuffer);
 
     // ---- Bone buffer (60 cubes × 8 bones = 480 bones)、mat4 fp16（16要素/骨、列優先）、CPU が毎フレーム更新 ----
     vk.totalBones = (uint32_t)(cubeCount * BONES_PER_CUBE);
@@ -686,7 +660,7 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
     CreateBuffer(vk, bSize,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 vk.boneBuffer, vk.boneAlloc);
+                 vk.boneBuffer);
     // 初期値は identity（fp16 対角1.0=0x3C00）
     {
         std::vector<uint16_t> identData(16u * vk.totalBones, 0u);
@@ -695,10 +669,9 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
             uint16_t* m = identData.data() + i * 16u;
             m[0] = m[5] = m[10] = m[15] = one;
         }
-        void* p;
-        vmaMapMemory(vk.allocator, vk.boneAlloc, &p);
-        memcpy(p, identData.data(), bSize);
-        vmaUnmapMemory(vk.allocator, vk.boneAlloc);
+        void* p = vk.boneBuffer.getAllocation().map();
+        std::memcpy(p, identData.data(), (size_t)bSize);
+        vk.boneBuffer.getAllocation().unmap();
     }
 }
 
@@ -781,6 +754,8 @@ static void CreateXrInstance(App& app) {
 
 // ---- Vulkan インスタンス・デバイス作成（OpenXR 経由）----
 static void CreateVulkanDevice(App& app) {
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(vkGetInstanceProcAddr);
+
     // Vulkan バージョン要件を確認
     XrGraphicsRequirementsVulkan2KHR req{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR};
     CHECK_XR(pfn_xrGetVulkanGraphicsRequirements2KHR(
@@ -807,28 +782,30 @@ static void CreateVulkanDevice(App& app) {
     xrInstCI.pfnGetInstanceProcAddr  = vkGetInstanceProcAddr;
     xrInstCI.vulkanCreateInfo        = &vkInstCI;
 
-    VkResult vkResult;
+    VkInstance rawInstance = VK_NULL_HANDLE;
+    VkResult vkResult = VK_SUCCESS;
     CHECK_XR(pfn_xrCreateVulkanInstanceKHR(
-        app.xr.instance, &xrInstCI, &app.vk.instance, &vkResult));
-    CHECK_VK(vkResult);
+        app.xr.instance, &xrInstCI, &rawInstance, &vkResult));
+    vk::detail::resultCheck(static_cast<vk::Result>(vkResult), "xrCreateVulkanInstanceKHR");
+    app.vk.instance = vk::raii::Instance(app.vk.context, rawInstance);
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(*app.vk.instance);
     LOGI("VkInstance created");
 
     // Physical Device を取得
     XrVulkanGraphicsDeviceGetInfoKHR devGetInfo{XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR};
     devGetInfo.systemId     = app.xr.systemId;
-    devGetInfo.vulkanInstance = app.vk.instance;
+    devGetInfo.vulkanInstance = Raw(app.vk.instance);
+    VkPhysicalDevice rawPhysDevice = VK_NULL_HANDLE;
     CHECK_XR(pfn_xrGetVulkanGraphicsDevice2KHR(
-        app.xr.instance, &devGetInfo, &app.vk.physDevice));
+        app.xr.instance, &devGetInfo, &rawPhysDevice));
+    app.vk.physDevice = vk::raii::PhysicalDevice(app.vk.instance, rawPhysDevice);
     LOGI("VkPhysicalDevice selected");
 
     // キューファミリー選択（グラフィックスキュー）
-    uint32_t qfCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(app.vk.physDevice, &qfCount, nullptr);
-    std::vector<VkQueueFamilyProperties> qfProps(qfCount);
-    vkGetPhysicalDeviceQueueFamilyProperties(app.vk.physDevice, &qfCount, qfProps.data());
+    const auto qfProps = app.vk.physDevice.getQueueFamilyProperties();
     app.vk.queueFamily = UINT32_MAX;
-    for (uint32_t i = 0; i < qfCount; i++) {
-        if (qfProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+    for (uint32_t i = 0; i < qfProps.size(); ++i) {
+        if (qfProps[i].queueFlags & vk::QueueFlagBits::eGraphics) {
             app.vk.queueFamily = i;
             break;
         }
@@ -836,8 +813,7 @@ static void CreateVulkanDevice(App& app) {
     assert(app.vk.queueFamily != UINT32_MAX);
 
     // maxPushConstantsSize を確認（multiview では mat4[2]+int = 132 バイト必要）
-    VkPhysicalDeviceProperties devProps;
-    vkGetPhysicalDeviceProperties(app.vk.physDevice, &devProps);
+    const auto devProps = app.vk.physDevice.getProperties();
     LOGI("maxPushConstantsSize=%u", devProps.limits.maxPushConstantsSize);
 
     // VkDevice 作成（xrCreateVulkanDeviceKHR 経由）
@@ -849,12 +825,9 @@ static void CreateVulkanDevice(App& app) {
 
     // VK_KHR_draw_indirect_count サポート確認
     {
-        uint32_t extCount = 0;
-        vkEnumerateDeviceExtensionProperties(app.vk.physDevice, nullptr, &extCount, nullptr);
-        std::vector<VkExtensionProperties> exts(extCount);
-        vkEnumerateDeviceExtensionProperties(app.vk.physDevice, nullptr, &extCount, exts.data());
+        const auto exts = app.vk.physDevice.enumerateDeviceExtensionProperties();
         bool found = false;
-        for (auto& e : exts) {
+        for (const auto& e : exts) {
             if (strcmp(e.extensionName, VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME) == 0) {
                 found = true; break;
             }
@@ -899,51 +872,46 @@ static void CreateVulkanDevice(App& app) {
     XrVulkanDeviceCreateInfoKHR xrDevCI{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
     xrDevCI.systemId               = app.xr.systemId;
     xrDevCI.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
-    xrDevCI.vulkanPhysicalDevice   = app.vk.physDevice;
+    xrDevCI.vulkanPhysicalDevice   = Raw(app.vk.physDevice);
     xrDevCI.vulkanCreateInfo       = &devCI;
 
+    VkDevice rawDevice = VK_NULL_HANDLE;
     CHECK_XR(pfn_xrCreateVulkanDeviceKHR(
-        app.xr.instance, &xrDevCI, &app.vk.device, &vkResult));
-    CHECK_VK(vkResult);
+        app.xr.instance, &xrDevCI, &rawDevice, &vkResult));
+    vk::detail::resultCheck(static_cast<vk::Result>(vkResult), "xrCreateVulkanDeviceKHR");
+    app.vk.device = vk::raii::Device(app.vk.physDevice, rawDevice);
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(*app.vk.device);
     LOGI("VkDevice created");
 
-    vkGetDeviceQueue(app.vk.device, app.vk.queueFamily, 0, &app.vk.queue);
+    app.vk.queue = app.vk.device.getQueue(app.vk.queueFamily, 0);
 
-    // Vulkan 拡張関数ポインタのロード
-    pfn_vkCmdBeginRenderingKHR   = reinterpret_cast<PFN_vkCmdBeginRenderingKHR>(
-        vkGetDeviceProcAddr(app.vk.device, "vkCmdBeginRenderingKHR"));
-    pfn_vkCmdEndRenderingKHR     = reinterpret_cast<PFN_vkCmdEndRenderingKHR>(
-        vkGetDeviceProcAddr(app.vk.device, "vkCmdEndRenderingKHR"));
+    pfn_vkCmdBeginRenderingKHR = reinterpret_cast<PFN_vkCmdBeginRenderingKHR>(
+        vkGetDeviceProcAddr(Raw(app.vk.device), "vkCmdBeginRenderingKHR"));
+    pfn_vkCmdEndRenderingKHR = reinterpret_cast<PFN_vkCmdEndRenderingKHR>(
+        vkGetDeviceProcAddr(Raw(app.vk.device), "vkCmdEndRenderingKHR"));
     pfn_vkCmdPipelineBarrier2KHR = reinterpret_cast<PFN_vkCmdPipelineBarrier2KHR>(
-        vkGetDeviceProcAddr(app.vk.device, "vkCmdPipelineBarrier2KHR"));
-    pfn_vkCmdWriteTimestamp2KHR  = reinterpret_cast<PFN_vkCmdWriteTimestamp2KHR>(
-        vkGetDeviceProcAddr(app.vk.device, "vkCmdWriteTimestamp2KHR"));
+        vkGetDeviceProcAddr(Raw(app.vk.device), "vkCmdPipelineBarrier2KHR"));
+    pfn_vkCmdWriteTimestamp2KHR = reinterpret_cast<PFN_vkCmdWriteTimestamp2KHR>(
+        vkGetDeviceProcAddr(Raw(app.vk.device), "vkCmdWriteTimestamp2KHR"));
     pfn_vkCmdPushDescriptorSetKHR = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
-        vkGetDeviceProcAddr(app.vk.device, "vkCmdPushDescriptorSetKHR"));
+        vkGetDeviceProcAddr(Raw(app.vk.device), "vkCmdPushDescriptorSetKHR"));
     assert(pfn_vkCmdBeginRenderingKHR && pfn_vkCmdEndRenderingKHR);
     assert(pfn_vkCmdPipelineBarrier2KHR && pfn_vkCmdWriteTimestamp2KHR);
     assert(pfn_vkCmdPushDescriptorSetKHR);
 
-    // VMA Allocator 初期化（Vulkan 関数は vkGetInstanceProcAddr 経由で動的ロード）
-    VmaVulkanFunctions vmaFns{};
-    vmaFns.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
-    vmaFns.vkGetDeviceProcAddr   = vkGetDeviceProcAddr;
-    VmaAllocatorCreateInfo aci{};
-    aci.physicalDevice   = app.vk.physDevice;
-    aci.device           = app.vk.device;
-    aci.instance         = app.vk.instance;
+    vma::AllocatorCreateInfo aci{};
+    aci.physicalDevice   = *app.vk.physDevice;
     aci.vulkanApiVersion = VK_API_VERSION_1_1;
-    aci.pVulkanFunctions = &vmaFns;
-    CHECK_VK(vmaCreateAllocator(&aci, &app.vk.allocator));
+    app.vk.allocator = vma::raii::Allocator(app.vk.instance, app.vk.device, aci);
     LOGI("VmaAllocator created");
 }
 
 // ---- XrSession 作成 ----
 static void CreateXrSession(App& app) {
     XrGraphicsBindingVulkan2KHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR};
-    binding.instance         = app.vk.instance;
-    binding.physicalDevice   = app.vk.physDevice;
-    binding.device           = app.vk.device;
+    binding.instance         = Raw(app.vk.instance);
+    binding.physicalDevice   = Raw(app.vk.physDevice);
+    binding.device           = Raw(app.vk.device);
     binding.queueFamilyIndex = app.vk.queueFamily;
     binding.queueIndex       = 0;
 
@@ -1026,14 +994,14 @@ static void CreateSwapchains(App& app) {
 
 static void CreateQueryPool(App& app) {
     VkPhysicalDeviceProperties props;
-    vkGetPhysicalDeviceProperties(app.vk.physDevice, &props);
+    vkGetPhysicalDeviceProperties(Raw(app.vk.physDevice), &props);
     app.vk.timestampPeriod = props.limits.timestampPeriod;
 
     // timestampValidBits が 0 のキューはタイムスタンプ非対応
     uint32_t qfCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(app.vk.physDevice, &qfCount, nullptr);
+    vkGetPhysicalDeviceQueueFamilyProperties(Raw(app.vk.physDevice), &qfCount, nullptr);
     std::vector<VkQueueFamilyProperties> qfProps(qfCount);
-    vkGetPhysicalDeviceQueueFamilyProperties(app.vk.physDevice, &qfCount, qfProps.data());
+    vkGetPhysicalDeviceQueueFamilyProperties(Raw(app.vk.physDevice), &qfCount, qfProps.data());
     uint32_t validBits = qfProps[app.vk.queueFamily].timestampValidBits;
     LOGI("timestampPeriod=%.2f ns  timestampValidBits=%u", app.vk.timestampPeriod, validBits);
     if (validBits == 0) {
@@ -1044,7 +1012,9 @@ static void CreateQueryPool(App& app) {
     VkQueryPoolCreateInfo ci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     ci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
     ci.queryCount = TS_COUNT;
-    CHECK_VK(vkCreateQueryPool(app.vk.device, &ci, nullptr, &app.vk.queryPool));
+    VkQueryPool rawQueryPool = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateQueryPool(Raw(app.vk.device), &ci, nullptr, &rawQueryPool));
+    app.vk.queryPool = vk::raii::QueryPool(app.vk.device, rawQueryPool);
     LOGI("QueryPool (timestamp x%u) created", TS_COUNT);
 }
 
@@ -1062,33 +1032,38 @@ static void CreateVsSkinPipeline(App& app, uint32_t width, uint32_t height) {
     dslCI.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     dslCI.bindingCount = 2;
     dslCI.pBindings    = bindings;
-    CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.vsSkinDescLayout));
+    VkDescriptorSetLayout rawDescLayout = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateDescriptorSetLayout(Raw(app.vk.device), &dslCI, nullptr, &rawDescLayout));
+    app.vk.vsSkinDescLayout = vk::raii::DescriptorSetLayout(app.vk.device, rawDescLayout);
 
     VkPushConstantRange pcRange{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4) * 2 + sizeof(int32_t)};
     VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plCI.setLayoutCount         = 1;
-    plCI.pSetLayouts            = &app.vk.vsSkinDescLayout;
+    VkDescriptorSetLayout vsSkinDescLayout = Raw(app.vk.vsSkinDescLayout);
+    plCI.pSetLayouts            = &vsSkinDescLayout;
     plCI.pushConstantRangeCount = 1;
     plCI.pPushConstantRanges    = &pcRange;
-    CHECK_VK(vkCreatePipelineLayout(app.vk.device, &plCI, nullptr, &app.vk.vsSkinPipelineLayout));
+    VkPipelineLayout rawPipelineLayout = VK_NULL_HANDLE;
+    CheckVkResult(vkCreatePipelineLayout(Raw(app.vk.device), &plCI, nullptr, &rawPipelineLayout));
+    app.vk.vsSkinPipelineLayout = vk::raii::PipelineLayout(app.vk.device, rawPipelineLayout);
 
     auto makeShader = [&](const uint32_t* spv, uint32_t size) {
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = size; ci.pCode = spv;
-        VkShaderModule mod;
-        CHECK_VK(vkCreateShaderModule(app.vk.device, &ci, nullptr, &mod));
-        return mod;
+        VkShaderModule rawModule = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateShaderModule(Raw(app.vk.device), &ci, nullptr, &rawModule));
+        return vk::raii::ShaderModule(app.vk.device, rawModule);
     };
-    VkShaderModule vertMod = makeShader(vertex_vs_skin_spv, vertex_vs_skin_spv_size);
-    VkShaderModule fragMod = makeShader(fragment_spv,       fragment_spv_size);
+    vk::raii::ShaderModule vertMod = makeShader(vertex_vs_skin_spv, vertex_vs_skin_spv_size);
+    vk::raii::ShaderModule fragMod = makeShader(fragment_spv,       fragment_spv_size);
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vertMod; stages[0].pName = "main";
+    stages[0].module = Raw(vertMod); stages[0].pName = "main";
     stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = fragMod; stages[1].pName = "main";
+    stages[1].module = Raw(fragMod); stages[1].pName = "main";
 
     VkPipelineVertexInputStateCreateInfo viCI{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo iaCI{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -1137,12 +1112,11 @@ static void CreateVsSkinPipeline(App& app, uint32_t width, uint32_t height) {
     gpCI.pMultisampleState   = &msCI;
     gpCI.pDepthStencilState  = &dsCI;
     gpCI.pColorBlendState    = &cbCI;
-    gpCI.layout              = app.vk.vsSkinPipelineLayout;
-    CHECK_VK(vkCreateGraphicsPipelines(
-        app.vk.device, VK_NULL_HANDLE, 1, &gpCI, nullptr, &app.vk.vsSkinPipeline));
-
-    vkDestroyShaderModule(app.vk.device, vertMod, nullptr);
-    vkDestroyShaderModule(app.vk.device, fragMod, nullptr);
+    gpCI.layout              = Raw(app.vk.vsSkinPipelineLayout);
+    VkPipeline rawPipeline = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateGraphicsPipelines(
+        Raw(app.vk.device), VK_NULL_HANDLE, 1, &gpCI, nullptr, &rawPipeline));
+    app.vk.vsSkinPipeline = vk::raii::Pipeline(app.vk.device, rawPipeline);
     LOGI("GraphicsPipeline (VS-skin mode=5) created");
 }
 
@@ -1169,7 +1143,9 @@ static void CreateSkinCullLdsPipeline(App& app) {
     dslCI.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     dslCI.bindingCount = 8;
     dslCI.pBindings    = bindings;
-    CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.skinCullLdsDescLayout));
+    VkDescriptorSetLayout rawDescLayout = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateDescriptorSetLayout(Raw(app.vk.device), &dslCI, nullptr, &rawDescLayout));
+    app.vk.skinCullLdsDescLayout = vk::raii::DescriptorSetLayout(app.vk.device, rawDescLayout);
 
     VkSamplerCreateInfo samplerCI{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     samplerCI.magFilter = VK_FILTER_NEAREST;
@@ -1180,24 +1156,32 @@ static void CreateSkinCullLdsPipeline(App& app) {
     samplerCI.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerCI.minLod = 0.0f;
     samplerCI.maxLod = 0.0f;
-    CHECK_VK(vkCreateSampler(app.vk.device, &samplerCI, nullptr, &app.vk.prevDepthSampler));
+    VkSampler rawPrevDepthSampler = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateSampler(Raw(app.vk.device), &samplerCI, nullptr, &rawPrevDepthSampler));
+    app.vk.prevDepthSampler = vk::raii::Sampler(app.vk.device, rawPrevDepthSampler);
 
     samplerCI.maxLod = (float)std::max<int32_t>((int32_t)app.xr.swapchains[0].hiZMipCount - 1, 0);
-    CHECK_VK(vkCreateSampler(app.vk.device, &samplerCI, nullptr, &app.vk.hiZSampler));
+    VkSampler rawHiZSampler = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateSampler(Raw(app.vk.device), &samplerCI, nullptr, &rawHiZSampler));
+    app.vk.hiZSampler = vk::raii::Sampler(app.vk.device, rawHiZSampler);
 
     // push constant: mat4[2] + vec4[2] + uvec4 + vec4 = 192 bytes
     VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0,
         sizeof(glm::mat4) * 2 + sizeof(glm::vec4) * 2 + sizeof(uint32_t) * 4 + sizeof(glm::vec4)};
     VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plCI.setLayoutCount = 1; plCI.pSetLayouts = &app.vk.skinCullLdsDescLayout;
+    VkDescriptorSetLayout skinCullDescLayout = Raw(app.vk.skinCullLdsDescLayout);
+    plCI.setLayoutCount = 1; plCI.pSetLayouts = &skinCullDescLayout;
     plCI.pushConstantRangeCount = 1; plCI.pPushConstantRanges = &pcRange;
-    CHECK_VK(vkCreatePipelineLayout(app.vk.device, &plCI, nullptr, &app.vk.skinCullLdsPipelineLayout));
+    VkPipelineLayout rawPipelineLayout = VK_NULL_HANDLE;
+    CheckVkResult(vkCreatePipelineLayout(Raw(app.vk.device), &plCI, nullptr, &rawPipelineLayout));
+    app.vk.skinCullLdsPipelineLayout = vk::raii::PipelineLayout(app.vk.device, rawPipelineLayout);
 
     VkShaderModuleCreateInfo smCI{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smCI.codeSize = skin_cull_lds_spv_size;
     smCI.pCode    = skin_cull_lds_spv;
-    VkShaderModule mod;
-    CHECK_VK(vkCreateShaderModule(app.vk.device, &smCI, nullptr, &mod));
+    VkShaderModule rawShaderModule = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateShaderModule(Raw(app.vk.device), &smCI, nullptr, &rawShaderModule));
+    vk::raii::ShaderModule mod(app.vk.device, rawShaderModule);
 
     VkComputePipelineCreateInfo cpCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroupSizeCI{
@@ -1205,13 +1189,14 @@ static void CreateSkinCullLdsPipeline(App& app) {
     subgroupSizeCI.requiredSubgroupSize = 64;
     cpCI.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     cpCI.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpCI.stage.module = mod;
+    cpCI.stage.module = Raw(mod);
     cpCI.stage.pName  = "main";
     cpCI.stage.flags  = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
     cpCI.stage.pNext  = &subgroupSizeCI;
-    cpCI.layout       = app.vk.skinCullLdsPipelineLayout;
-    CHECK_VK(vkCreateComputePipelines(app.vk.device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &app.vk.skinCullLdsPipeline));
-    vkDestroyShaderModule(app.vk.device, mod, nullptr);
+    cpCI.layout       = Raw(app.vk.skinCullLdsPipelineLayout);
+    VkPipeline rawPipeline = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateComputePipelines(Raw(app.vk.device), VK_NULL_HANDLE, 1, &cpCI, nullptr, &rawPipeline));
+    app.vk.skinCullLdsPipeline = vk::raii::Pipeline(app.vk.device, rawPipeline);
     LOGI("ComputePipeline (skin+cull LDS mode=7) created, meshlets=%u", app.vk.meshletCount);
 }
 
@@ -1225,12 +1210,11 @@ static void CreateHiZSpdPipeline(App& app) {
     CreateBuffer(app.vk, sizeof(uint32_t) * 2u,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 app.vk.hiZSpdAtomicBuffer, app.vk.hiZSpdAtomicAlloc);
+                 app.vk.hiZSpdAtomicBuffer);
     {
-        void* p = nullptr;
-        vmaMapMemory(app.vk.allocator, app.vk.hiZSpdAtomicAlloc, &p);
+        void* p = app.vk.hiZSpdAtomicBuffer.getAllocation().map();
         std::memset(p, 0, sizeof(uint32_t) * 2u);
-        vmaUnmapMemory(app.vk.allocator, app.vk.hiZSpdAtomicAlloc);
+        app.vk.hiZSpdAtomicBuffer.getAllocation().unmap();
     }
 
     VkDescriptorSetLayoutBinding bindings[15]{};
@@ -1253,30 +1237,37 @@ static void CreateHiZSpdPipeline(App& app) {
     dslCI.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     dslCI.bindingCount = 15;
     dslCI.pBindings = bindings;
-    CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.hiZSpdDescLayout));
+    VkDescriptorSetLayout rawDescLayout = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateDescriptorSetLayout(Raw(app.vk.device), &dslCI, nullptr, &rawDescLayout));
+    app.vk.hiZSpdDescLayout = vk::raii::DescriptorSetLayout(app.vk.device, rawDescLayout);
 
     VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 4};
     VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plCI.setLayoutCount = 1;
-    plCI.pSetLayouts = &app.vk.hiZSpdDescLayout;
+    VkDescriptorSetLayout hiZDescLayout = Raw(app.vk.hiZSpdDescLayout);
+    plCI.pSetLayouts = &hiZDescLayout;
     plCI.pushConstantRangeCount = 1;
     plCI.pPushConstantRanges = &pcRange;
-    CHECK_VK(vkCreatePipelineLayout(app.vk.device, &plCI, nullptr, &app.vk.hiZSpdPipelineLayout));
+    VkPipelineLayout rawPipelineLayout = VK_NULL_HANDLE;
+    CheckVkResult(vkCreatePipelineLayout(Raw(app.vk.device), &plCI, nullptr, &rawPipelineLayout));
+    app.vk.hiZSpdPipelineLayout = vk::raii::PipelineLayout(app.vk.device, rawPipelineLayout);
 
     VkShaderModuleCreateInfo smCI{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smCI.codeSize = hiz_spd_spv_size;
     smCI.pCode = hiz_spd_spv;
-    VkShaderModule mod = VK_NULL_HANDLE;
-    CHECK_VK(vkCreateShaderModule(app.vk.device, &smCI, nullptr, &mod));
+    VkShaderModule rawShaderModule = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateShaderModule(Raw(app.vk.device), &smCI, nullptr, &rawShaderModule));
+    vk::raii::ShaderModule mod(app.vk.device, rawShaderModule);
 
     VkComputePipelineCreateInfo cpCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpCI.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     cpCI.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpCI.stage.module = mod;
+    cpCI.stage.module = Raw(mod);
     cpCI.stage.pName = "main";
-    cpCI.layout = app.vk.hiZSpdPipelineLayout;
-    CHECK_VK(vkCreateComputePipelines(app.vk.device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &app.vk.hiZSpdPipeline));
-    vkDestroyShaderModule(app.vk.device, mod, nullptr);
+    cpCI.layout = Raw(app.vk.hiZSpdPipelineLayout);
+    VkPipeline rawPipeline = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateComputePipelines(Raw(app.vk.device), VK_NULL_HANDLE, 1, &cpCI, nullptr, &rawPipeline));
+    app.vk.hiZSpdPipeline = vk::raii::Pipeline(app.vk.device, rawPipeline);
 }
 
 static void CreateMeshletDebugPipeline(App& app, uint32_t width, uint32_t height) {
@@ -1294,35 +1285,40 @@ static void CreateMeshletDebugPipeline(App& app, uint32_t width, uint32_t height
     dslCI.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     dslCI.bindingCount = 2;
     dslCI.pBindings = bindings;
-    CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.meshletDebugDescLayout));
+    VkDescriptorSetLayout rawDescLayout = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateDescriptorSetLayout(Raw(app.vk.device), &dslCI, nullptr, &rawDescLayout));
+    app.vk.meshletDebugDescLayout = vk::raii::DescriptorSetLayout(app.vk.device, rawDescLayout);
 
     VkPushConstantRange pcRange{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4) * 2 + sizeof(glm::vec4)};
     VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plCI.setLayoutCount = 1;
-    plCI.pSetLayouts = &app.vk.meshletDebugDescLayout;
+    VkDescriptorSetLayout meshletDescLayout = Raw(app.vk.meshletDebugDescLayout);
+    plCI.pSetLayouts = &meshletDescLayout;
     plCI.pushConstantRangeCount = 1;
     plCI.pPushConstantRanges = &pcRange;
-    CHECK_VK(vkCreatePipelineLayout(app.vk.device, &plCI, nullptr, &app.vk.meshletDebugPipelineLayout));
+    VkPipelineLayout rawPipelineLayout = VK_NULL_HANDLE;
+    CheckVkResult(vkCreatePipelineLayout(Raw(app.vk.device), &plCI, nullptr, &rawPipelineLayout));
+    app.vk.meshletDebugPipelineLayout = vk::raii::PipelineLayout(app.vk.device, rawPipelineLayout);
 
     auto makeShader = [&](const uint32_t* spv, uint32_t size) {
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = size;
         ci.pCode = spv;
-        VkShaderModule mod = VK_NULL_HANDLE;
-        CHECK_VK(vkCreateShaderModule(app.vk.device, &ci, nullptr, &mod));
-        return mod;
+        VkShaderModule rawShaderModule = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateShaderModule(Raw(app.vk.device), &ci, nullptr, &rawShaderModule));
+        return vk::raii::ShaderModule(app.vk.device, rawShaderModule);
     };
-    VkShaderModule vertMod = makeShader(meshlet_aabb_debug_vert_spv, meshlet_aabb_debug_vert_spv_size);
-    VkShaderModule fragMod = makeShader(meshlet_aabb_debug_frag_spv, meshlet_aabb_debug_frag_spv_size);
+    vk::raii::ShaderModule vertMod = makeShader(meshlet_aabb_debug_vert_spv, meshlet_aabb_debug_vert_spv_size);
+    vk::raii::ShaderModule fragMod = makeShader(meshlet_aabb_debug_frag_spv, meshlet_aabb_debug_frag_spv_size);
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vertMod;
+    stages[0].module = Raw(vertMod);
     stages[0].pName = "main";
     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = fragMod;
+    stages[1].module = Raw(fragMod);
     stages[1].pName = "main";
 
     VkPipelineVertexInputStateCreateInfo viCI{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -1349,8 +1345,8 @@ static void CreateMeshletDebugPipeline(App& app, uint32_t width, uint32_t height
     VkPipelineColorBlendAttachmentState cbAtt[3]{};
     cbAtt[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    cbAtt[1].colorWriteMask = 0;
-    cbAtt[2].colorWriteMask = 0;
+    cbAtt[1].colorWriteMask = {};
+    cbAtt[2].colorWriteMask = {};
     VkPipelineColorBlendStateCreateInfo cbCI{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cbCI.attachmentCount = 3;
     cbCI.pAttachments = cbAtt;
@@ -1374,11 +1370,10 @@ static void CreateMeshletDebugPipeline(App& app, uint32_t width, uint32_t height
     gpCI.pMultisampleState = &msCI;
     gpCI.pDepthStencilState = &dsCI;
     gpCI.pColorBlendState = &cbCI;
-    gpCI.layout = app.vk.meshletDebugPipelineLayout;
-    CHECK_VK(vkCreateGraphicsPipelines(app.vk.device, VK_NULL_HANDLE, 1, &gpCI, nullptr, &app.vk.meshletDebugPipeline));
-
-    vkDestroyShaderModule(app.vk.device, vertMod, nullptr);
-    vkDestroyShaderModule(app.vk.device, fragMod, nullptr);
+    gpCI.layout = Raw(app.vk.meshletDebugPipelineLayout);
+    VkPipeline rawPipeline = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateGraphicsPipelines(Raw(app.vk.device), VK_NULL_HANDLE, 1, &gpCI, nullptr, &rawPipeline));
+    app.vk.meshletDebugPipeline = vk::raii::Pipeline(app.vk.device, rawPipeline);
 }
 
 // ---- ImageView / Framebuffer / CommandBuffer を作成（multiview: 1 swapchain） ----
@@ -1387,7 +1382,9 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
     VkCommandPoolCreateInfo cpCI{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpCI.queueFamilyIndex = app.vk.queueFamily;
     cpCI.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    CHECK_VK(vkCreateCommandPool(app.vk.device, &cpCI, nullptr, &app.vk.cmdPool));
+    VkCommandPool rawCommandPool = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateCommandPool(Raw(app.vk.device), &cpCI, nullptr, &rawCommandPool));
+    app.vk.cmdPool = vk::raii::CommandPool(app.vk.device, rawCommandPool);
 
     // multiview では swapchain は1つ（arraySize=2）
     EyeSwapchain& sc = app.xr.swapchains[0];
@@ -1404,56 +1401,63 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
     CreateImage(app.vk, sc.width, sc.height,
                 VK_FORMAT_D32_SFLOAT,
                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                sc.depthImage, sc.depthAlloc,
+                sc.depthImage,
                 2 /* arrayLayers=2 */);
 
     VkImageViewCreateInfo dvCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    dvCI.image    = sc.depthImage;
+    dvCI.image    = Raw(sc.depthImage);
     dvCI.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     dvCI.format   = VK_FORMAT_D32_SFLOAT;
     dvCI.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT,
                              0, 1, 0, 2 /* layerCount=2 */};
-    CHECK_VK(vkCreateImageView(app.vk.device, &dvCI, nullptr, &sc.depthView));
+    VkImageView rawDepthView = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateImageView(Raw(app.vk.device), &dvCI, nullptr, &rawDepthView));
+    sc.depthView = vk::raii::ImageView(app.vk.device, rawDepthView);
     sc.depthSampleView = CreateImageView(
-        app.vk, sc.depthImage, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT,
+        app.vk, Raw(sc.depthImage), VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT,
         VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, 1, 0, 2);
 
     for (uint32_t ping = 0; ping < 2; ++ping) {
         CreateImage(app.vk, sc.width, sc.height,
                     VK_FORMAT_R32_SFLOAT,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    sc.prevDepthImages[ping], sc.prevDepthAllocs[ping],
+                    sc.prevDepthImages[ping],
                     2 /* arrayLayers=2 */);
 
         VkImageViewCreateInfo pvCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        pvCI.image    = sc.prevDepthImages[ping];
+        pvCI.image    = Raw(sc.prevDepthImages[ping]);
         pvCI.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         pvCI.format   = VK_FORMAT_R32_SFLOAT;
         pvCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
-        CHECK_VK(vkCreateImageView(app.vk.device, &pvCI, nullptr, &sc.prevDepthViews[ping]));
+        VkImageView rawPrevDepthView = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateImageView(Raw(app.vk.device), &pvCI, nullptr, &rawPrevDepthView));
+        sc.prevDepthViews[ping] = vk::raii::ImageView(app.vk.device, rawPrevDepthView);
 
         CreateImage(app.vk, sc.width, sc.height,
                     VK_FORMAT_R16G16B16A16_SFLOAT,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    sc.motionImages[ping], sc.motionAllocs[ping],
+                    sc.motionImages[ping],
                     2 /* arrayLayers=2 */);
-        pvCI.image  = sc.motionImages[ping];
+        pvCI.image  = Raw(sc.motionImages[ping]);
         pvCI.format = VK_FORMAT_R16G16B16A16_SFLOAT;
-        CHECK_VK(vkCreateImageView(app.vk.device, &pvCI, nullptr, &sc.motionViews[ping]));
+        VkImageView rawMotionView = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateImageView(Raw(app.vk.device), &pvCI, nullptr, &rawMotionView));
+        sc.motionViews[ping] = vk::raii::ImageView(app.vk.device, rawMotionView);
 
         CreateImage(app.vk, sc.hiZW, sc.hiZH,
                     VK_FORMAT_R32_SFLOAT,
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    sc.hiZImages[ping], sc.hiZAllocs[ping],
+                    sc.hiZImages[ping],
                     2 /* arrayLayers=2 */, sc.hiZMipCount);
         sc.hiZViews[ping] = CreateImageView(
-            app.vk, sc.hiZImages[ping], VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
+            app.vk, Raw(sc.hiZImages[ping]), VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
             VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, sc.hiZMipCount, 0, 2);
-        sc.hiZMipViews[ping].resize(sc.hiZMipCount);
+        sc.hiZMipViews[ping].clear();
+        sc.hiZMipViews[ping].reserve(sc.hiZMipCount);
         for (uint32_t level = 0; level < sc.hiZMipCount; ++level) {
-            sc.hiZMipViews[ping][level] = CreateImageView(
-                app.vk, sc.hiZImages[ping], VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
-                VK_IMAGE_VIEW_TYPE_2D_ARRAY, level, 1, 0, 2);
+            sc.hiZMipViews[ping].emplace_back(CreateImageView(
+                app.vk, Raw(sc.hiZImages[ping]), VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_VIEW_TYPE_2D_ARRAY, level, 1, 0, 2));
         }
 
     }
@@ -1467,24 +1471,33 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
         civCI.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         civCI.format   = colorFormat;
         civCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2 /* layerCount=2 */};
-        CHECK_VK(vkCreateImageView(app.vk.device, &civCI, nullptr, &si.view));
+        VkImageView rawSwapchainView = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateImageView(Raw(app.vk.device), &civCI, nullptr, &rawSwapchainView));
+        si.view = vk::raii::ImageView(app.vk.device, rawSwapchainView);
     }
 
     // コマンドバッファ（imageIdx の1次元）
-    app.vk.cmdBuffers.resize(imgCount);
     VkCommandBufferAllocateInfo cbAI{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbAI.commandPool        = app.vk.cmdPool;
+    cbAI.commandPool        = Raw(app.vk.cmdPool);
     cbAI.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cbAI.commandBufferCount = imgCount;
-    CHECK_VK(vkAllocateCommandBuffers(app.vk.device, &cbAI, app.vk.cmdBuffers.data()));
+    std::vector<VkCommandBuffer> rawCommandBuffers(imgCount, VK_NULL_HANDLE);
+    CheckVkResult(vkAllocateCommandBuffers(Raw(app.vk.device), &cbAI, rawCommandBuffers.data()));
+    app.vk.cmdBuffers.clear();
+    app.vk.cmdBuffers.reserve(imgCount);
+    for (VkCommandBuffer rawCommandBuffer : rawCommandBuffers) {
+        app.vk.cmdBuffers.emplace_back(app.vk.device, rawCommandBuffer, Raw(app.vk.cmdPool));
+    }
 
     // フェンス
     VkFenceCreateInfo fCI{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fCI.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    CHECK_VK(vkCreateFence(app.vk.device, &fCI, nullptr, &app.vk.fence));
+    VkFence rawFence = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateFence(Raw(app.vk.device), &fCI, nullptr, &rawFence));
+    app.vk.fence = vk::raii::Fence(app.vk.device, rawFence);
 
     for (uint32_t ping = 0; ping < 2; ++ping) {
-        TransitionImageLayoutNow(app.vk, sc.hiZImages[ping], VK_IMAGE_ASPECT_COLOR_BIT,
+        TransitionImageLayoutNow(app.vk, Raw(sc.hiZImages[ping]), VK_IMAGE_ASPECT_COLOR_BIT,
                                  VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 2, sc.hiZMipCount);
     }
 }
@@ -1574,26 +1587,26 @@ static void RenderStereo(App& app, uint32_t imageIdx,
                          uint32_t swapW, uint32_t swapH) {
     const uint32_t prevDepthReadIdx  = app.frameParity & 1u;
     const uint32_t prevDepthWriteIdx = prevDepthReadIdx ^ 1u;
-    VkCommandBuffer cmd = app.vk.cmdBuffers[imageIdx];
+    VkCommandBuffer cmd = Raw(app.vk.cmdBuffers[imageIdx]);
     EyeSwapchain&   sc  = app.xr.swapchains[0];
 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    CHECK_VK(vkBeginCommandBuffer(cmd, &bi));
+    CheckVkResult(vkBeginCommandBuffer(cmd, &bi));
 
     glm::mat4 model = CubeModelMatrix();
     glm::mat4 mvp0  = ComputeMVP(views[0], model);
     glm::mat4 mvp1  = ComputeMVP(views[1], model);
 
     // タイムスタンプリセット（queryPool が有効なときのみ）
-    if (app.vk.queryPool != VK_NULL_HANDLE) {
-        vkCmdResetQueryPool(cmd, app.vk.queryPool, 0, TS_COUNT);
+    if (IsValid(app.vk.queryPool)) {
+        vkCmdResetQueryPool(cmd, Raw(app.vk.queryPool), 0, TS_COUNT);
     }
 
     // t0: CS 開始直前
-    if (app.vk.queryPool != VK_NULL_HANDLE) {
+    if (IsValid(app.vk.queryPool)) {
         vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR,
-                               app.vk.queryPool, TS_CS_BEGIN);
+                               Raw(app.vk.queryPool), TS_CS_BEGIN);
     }
 
     // ---- Compute pass: mode=7 CS LDS skin+cull ----
@@ -1605,9 +1618,9 @@ static void RenderStereo(App& app, uint32_t imageIdx,
         0,
         0,
     };
-    vkCmdUpdateBuffer(cmd, app.vk.bfDrawCmdBuffer, 0, sizeof(drawCmdInit), drawCmdInit);
+    vkCmdUpdateBuffer(cmd, Raw(app.vk.bfDrawCmdBuffer), 0, sizeof(drawCmdInit), drawCmdInit);
     uint32_t cullStatsInit[4] = {0, 0, 0, 0};
-    vkCmdUpdateBuffer(cmd, app.vk.cullStatsBuffer, 0, sizeof(cullStatsInit), cullStatsInit);
+    vkCmdUpdateBuffer(cmd, Raw(app.vk.cullStatsBuffer), 0, sizeof(cullStatsInit), cullStatsInit);
 
     VkMemoryBarrier2KHR fillToCs{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR};
     fillToCs.srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR;
@@ -1622,20 +1635,20 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     }
 
     // ---- mode=7: LBS + backface cull、LDS で頂点共有（1 wg = 1 meshlet）----
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.skinCullLdsPipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, Raw(app.vk.skinCullLdsPipeline));
     {
         VkDescriptorBufferInfo bufs[7] = {
-            {app.vk.meshletBuffer,      0, VK_WHOLE_SIZE},
-            {app.vk.vertexBuffer,       0, VK_WHOLE_SIZE},
-            {app.vk.boneBuffer,         0, VK_WHOLE_SIZE},
-            {app.vk.indexBuffer,        0, VK_WHOLE_SIZE},
-            {app.vk.compactIndexBuffer, 0, VK_WHOLE_SIZE},
-            {app.vk.bfDrawCmdBuffer,    0, VK_WHOLE_SIZE},
-            {app.vk.cullStatsBuffer,    0, VK_WHOLE_SIZE},
+            {Raw(app.vk.meshletBuffer),      0, VK_WHOLE_SIZE},
+            {Raw(app.vk.vertexBuffer),       0, VK_WHOLE_SIZE},
+            {Raw(app.vk.boneBuffer),         0, VK_WHOLE_SIZE},
+            {Raw(app.vk.indexBuffer),        0, VK_WHOLE_SIZE},
+            {Raw(app.vk.compactIndexBuffer), 0, VK_WHOLE_SIZE},
+            {Raw(app.vk.bfDrawCmdBuffer),    0, VK_WHOLE_SIZE},
+            {Raw(app.vk.cullStatsBuffer),    0, VK_WHOLE_SIZE},
         };
         VkDescriptorImageInfo hiZImg{};
-        hiZImg.sampler     = app.vk.hiZSampler;
-        hiZImg.imageView   = sc.hiZViews[prevDepthReadIdx];
+        hiZImg.sampler     = Raw(app.vk.hiZSampler);
+        hiZImg.imageView   = Raw(sc.hiZViews[prevDepthReadIdx]);
         hiZImg.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         VkWriteDescriptorSet w[8]{};
         for (uint32_t i = 0; i < 6; i++) {
@@ -1656,7 +1669,7 @@ static void RenderStereo(App& app, uint32_t imageIdx,
         w[7].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         w[7].pBufferInfo     = &bufs[6];
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                  app.vk.skinCullLdsPipelineLayout, 0, 8, w);
+                                  Raw(app.vk.skinCullLdsPipelineLayout), 0, 8, w);
     }
 
     struct SkinCullLdsPC {
@@ -1683,7 +1696,7 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     lpc.prevDepthEnabled = app.prevDepthValid ? 1u : 0u;
     lpc.prevDepthParams = glm::vec4((float)swapW, (float)swapH, 0.02f,
                                     (float)app.xr.swapchains[0].hiZMipCount);
-    vkCmdPushConstants(cmd, app.vk.skinCullLdsPipelineLayout,
+    vkCmdPushConstants(cmd, Raw(app.vk.skinCullLdsPipelineLayout),
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lpc), &lpc);
     if (app.prevDepthValid) {
         VkImageMemoryBarrier2KHR prevDepthToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
@@ -1695,7 +1708,7 @@ static void RenderStereo(App& app, uint32_t imageIdx,
         prevDepthToRead.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
         prevDepthToRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         prevDepthToRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        prevDepthToRead.image               = sc.hiZImages[prevDepthReadIdx];
+        prevDepthToRead.image               = Raw(sc.hiZImages[prevDepthReadIdx]);
         prevDepthToRead.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
                                                sc.hiZMipCount, 0, 2};
         VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
@@ -1706,9 +1719,9 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     vkCmdDispatch(cmd, app.vk.meshletCount, 1, 1);
 
     // t1: CS 終了（dispatch 完了後）
-    if (app.vk.queryPool != VK_NULL_HANDLE) {
+    if (IsValid(app.vk.queryPool)) {
         vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
-                               app.vk.queryPool, TS_CS_END);
+                               Raw(app.vk.queryPool), TS_CS_END);
     }
 
     // compute → indirect + index read
@@ -1727,9 +1740,9 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     }
 
     // t2: Graphics pass 開始直前
-    if (app.vk.queryPool != VK_NULL_HANDLE) {
+    if (IsValid(app.vk.queryPool)) {
         vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR,
-                               app.vk.queryPool, TS_GFX_BEGIN);
+                               Raw(app.vk.queryPool), TS_GFX_BEGIN);
     }
 
     // ---- Graphics pass ----
@@ -1739,7 +1752,7 @@ static void RenderStereo(App& app, uint32_t imageIdx,
         for (auto& b : barriers) {
             b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR;
             b.srcStageMask        = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR;
-            b.srcAccessMask       = 0;
+            b.srcAccessMask       = {};
             b.dstStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR;
             b.dstAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR;
             b.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1754,11 +1767,11 @@ static void RenderStereo(App& app, uint32_t imageIdx,
                                   | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT_KHR;
         barriers[1].dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT_KHR
                                   | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT_KHR;
-        barriers[1].image            = sc.depthImage;
+        barriers[1].image            = Raw(sc.depthImage);
         barriers[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
-        barriers[2].image            = sc.prevDepthImages[prevDepthWriteIdx];
+        barriers[2].image            = Raw(sc.prevDepthImages[prevDepthWriteIdx]);
         barriers[2].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
-        barriers[3].image            = sc.motionImages[prevDepthWriteIdx];
+        barriers[3].image            = Raw(sc.motionImages[prevDepthWriteIdx]);
         barriers[3].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
 
         VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
@@ -1769,7 +1782,7 @@ static void RenderStereo(App& app, uint32_t imageIdx,
 
     VkRenderingAttachmentInfoKHR colorAtts[3]{};
     colorAtts[0].sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
-    colorAtts[0].imageView   = sc.images[imageIdx].view;
+    colorAtts[0].imageView   = Raw(sc.images[imageIdx].view);
     colorAtts[0].imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
     colorAtts[0].loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAtts[0].storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
@@ -1779,20 +1792,20 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     colorAtts[0].clearValue.color.float32[3] = 1.0f;
 
     colorAtts[1].sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
-    colorAtts[1].imageView   = sc.prevDepthViews[prevDepthWriteIdx];
+    colorAtts[1].imageView   = Raw(sc.prevDepthViews[prevDepthWriteIdx]);
     colorAtts[1].imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
     colorAtts[1].loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAtts[1].storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
     colorAtts[1].clearValue.color.float32[0] = 1.0f;
 
     colorAtts[2].sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
-    colorAtts[2].imageView   = sc.motionViews[prevDepthWriteIdx];
+    colorAtts[2].imageView   = Raw(sc.motionViews[prevDepthWriteIdx]);
     colorAtts[2].imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
     colorAtts[2].loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAtts[2].storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
 
     VkRenderingAttachmentInfoKHR depthAtt{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
-    depthAtt.imageView              = sc.depthView;
+    depthAtt.imageView              = Raw(sc.depthView);
     depthAtt.imageLayout            = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
     depthAtt.loadOp                 = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAtt.storeOp                = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -1816,13 +1829,13 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     pc.aluIters = (int32_t)app.aluIters;
 
     // mode=7: FatVertex+Bone SSBO を VS で読んで LBS
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.vsSkinPipeline);
-    vkCmdPushConstants(cmd, app.vk.vsSkinPipelineLayout,
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Raw(app.vk.vsSkinPipeline));
+    vkCmdPushConstants(cmd, Raw(app.vk.vsSkinPipelineLayout),
                        VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
     {
         VkDescriptorBufferInfo bufs[2] = {
-            {app.vk.vertexBuffer, 0, VK_WHOLE_SIZE},
-            {app.vk.boneBuffer,   0, VK_WHOLE_SIZE},
+            {Raw(app.vk.vertexBuffer), 0, VK_WHOLE_SIZE},
+            {Raw(app.vk.boneBuffer),   0, VK_WHOLE_SIZE},
         };
         VkWriteDescriptorSet w[2]{};
         for (uint32_t i = 0; i < 2; i++) {
@@ -1833,12 +1846,12 @@ static void RenderStereo(App& app, uint32_t imageIdx,
             w[i].pBufferInfo     = &bufs[i];
         }
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                  app.vk.vsSkinPipelineLayout, 0, 2, w);
+                                  Raw(app.vk.vsSkinPipelineLayout), 0, 2, w);
     }
 
     // compactIndex + bfDrawCmd による indirect draw (mode=7)
-    vkCmdBindIndexBuffer(cmd, app.vk.compactIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexedIndirect(cmd, app.vk.bfDrawCmdBuffer, 0, 1, 0);
+    vkCmdBindIndexBuffer(cmd, Raw(app.vk.compactIndexBuffer), 0, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexedIndirect(cmd, Raw(app.vk.bfDrawCmdBuffer), 0, 1, 0);
 
     struct MeshletDebugPC {
         glm::mat4 mvp[2];
@@ -1848,12 +1861,12 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     dbgPc.mvp[1] = mvp1;
     dbgPc.viewportAndBias = glm::vec4((float)swapW, (float)swapH, 0.02f,
                                       (float)app.xr.swapchains[0].hiZMipCount);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.meshletDebugPipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Raw(app.vk.meshletDebugPipeline));
     {
-        VkDescriptorBufferInfo meshletBuf{app.vk.meshletBuffer, 0, VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo meshletBuf{Raw(app.vk.meshletBuffer), 0, VK_WHOLE_SIZE};
         VkDescriptorImageInfo hiZImg{};
-        hiZImg.sampler     = app.vk.hiZSampler;
-        hiZImg.imageView   = sc.hiZViews[prevDepthReadIdx];
+        hiZImg.sampler     = Raw(app.vk.hiZSampler);
+        hiZImg.imageView   = Raw(sc.hiZViews[prevDepthReadIdx]);
         hiZImg.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         VkWriteDescriptorSet w[2]{};
         w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1867,17 +1880,17 @@ static void RenderStereo(App& app, uint32_t imageIdx,
         w[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[1].pImageInfo      = &hiZImg;
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                  app.vk.meshletDebugPipelineLayout, 0, 2, w);
+                                  Raw(app.vk.meshletDebugPipelineLayout), 0, 2, w);
     }
-    vkCmdPushConstants(cmd, app.vk.meshletDebugPipelineLayout,
+    vkCmdPushConstants(cmd, Raw(app.vk.meshletDebugPipelineLayout),
                        VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(dbgPc), &dbgPc);
     vkCmdDraw(cmd, 24u, app.vk.meshletCount, 0u, 0u);
 
     vkCmdEndRenderingKHR(cmd);
 
-    if (app.vk.queryPool != VK_NULL_HANDLE) {
+    if (IsValid(app.vk.queryPool)) {
         vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT_KHR,
-                               app.vk.queryPool, TS_GFX_END);
+                               Raw(app.vk.queryPool), TS_GFX_END);
     }
 
     VkImageMemoryBarrier2KHR depthToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
@@ -1889,7 +1902,7 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     depthToRead.newLayout           = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL_KHR;
     depthToRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     depthToRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    depthToRead.image               = sc.depthImage;
+    depthToRead.image               = Raw(sc.depthImage);
     depthToRead.subresourceRange    = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
     {
         VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
@@ -1911,22 +1924,22 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     spdPc.srcWidth = app.xr.swapchains[0].width;
     spdPc.srcHeight = app.xr.swapchains[0].height;
 
-    if (app.vk.queryPool != VK_NULL_HANDLE) {
+    if (IsValid(app.vk.queryPool)) {
         vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
-                               app.vk.queryPool, TS_HIZ_BEGIN);
+                               Raw(app.vk.queryPool), TS_HIZ_BEGIN);
     }
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.hiZSpdPipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, Raw(app.vk.hiZSpdPipeline));
     {
         VkDescriptorImageInfo srcInfo{};
-        srcInfo.sampler     = app.vk.prevDepthSampler;
-        srcInfo.imageView   = sc.depthSampleView;
+        srcInfo.sampler     = Raw(app.vk.prevDepthSampler);
+        srcInfo.imageView   = Raw(sc.depthSampleView);
         srcInfo.imageLayout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL_KHR;
-        VkDescriptorBufferInfo counterInfo{app.vk.hiZSpdAtomicBuffer, 0, sizeof(uint32_t) * 2u};
+        VkDescriptorBufferInfo counterInfo{Raw(app.vk.hiZSpdAtomicBuffer), 0, sizeof(uint32_t) * 2u};
         std::vector<VkDescriptorImageInfo> mipInfos(13);
         for (uint32_t i = 0; i < 13; ++i) {
             const uint32_t level = std::min<uint32_t>(i == 0 ? 5u : (i - 1u), sc.hiZMipCount - 1u);
-            mipInfos[i].imageView   = sc.hiZMipViews[prevDepthWriteIdx][level];
+            mipInfos[i].imageView   = Raw(sc.hiZMipViews[prevDepthWriteIdx][level]);
             mipInfos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         }
         std::vector<VkWriteDescriptorSet> w(15);
@@ -1946,10 +1959,10 @@ static void RenderStereo(App& app, uint32_t imageIdx,
             w[i + 2].pImageInfo      = &mipInfos[i];
         }
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                  app.vk.hiZSpdPipelineLayout, 0,
+                                  Raw(app.vk.hiZSpdPipelineLayout), 0,
                                   (uint32_t)w.size(), w.data());
     }
-    vkCmdPushConstants(cmd, app.vk.hiZSpdPipelineLayout,
+    vkCmdPushConstants(cmd, Raw(app.vk.hiZSpdPipelineLayout),
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(spdPc), &spdPc);
     vkCmdDispatch(cmd, spdDispatchX, spdDispatchY, 2u);
 
@@ -1962,7 +1975,7 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     hiZBarrier.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
     hiZBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     hiZBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hiZBarrier.image               = sc.hiZImages[prevDepthWriteIdx];
+    hiZBarrier.image               = Raw(sc.hiZImages[prevDepthWriteIdx]);
     hiZBarrier.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, sc.hiZMipCount, 0, 2};
     {
         VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
@@ -1971,12 +1984,12 @@ static void RenderStereo(App& app, uint32_t imageIdx,
         vkCmdPipelineBarrier2KHR(cmd, &dep);
     }
 
-    if (app.vk.queryPool != VK_NULL_HANDLE) {
+    if (IsValid(app.vk.queryPool)) {
         vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
-                               app.vk.queryPool, TS_HIZ_END);
+                               Raw(app.vk.queryPool), TS_HIZ_END);
     }
 
-    CHECK_VK(vkEndCommandBuffer(cmd));
+    CheckVkResult(vkEndCommandBuffer(cmd));
 }
 
 // ---- 1 フレームをレンダリング ----
@@ -2044,7 +2057,8 @@ static void RenderFrame(App& app) {
         }
 
         // フェンス待機 & リセット
-        vkWaitForFences(app.vk.device, 1, &app.vk.fence, VK_TRUE, UINT64_MAX);
+        VkFence fence = Raw(app.vk.fence);
+        CheckVkResult(vkWaitForFences(Raw(app.vk.device), 1, &fence, VK_TRUE, UINT64_MAX));
 
         // ---- CPU ボーン行列更新（前フレームの GPU 使用が完了した後）----
         {
@@ -2054,10 +2068,10 @@ static void RenderFrame(App& app) {
         }
 
         // タイムスタンプ読み出し
-        if (app.vk.queryPool != VK_NULL_HANDLE) {
+        if (IsValid(app.vk.queryPool)) {
             uint64_t ts[TS_COUNT] = {};
             VkResult qr = vkGetQueryPoolResults(
-                app.vk.device, app.vk.queryPool, 0, TS_COUNT,
+                Raw(app.vk.device), Raw(app.vk.queryPool), 0, TS_COUNT,
                 sizeof(ts), ts, sizeof(uint64_t),
                 VK_QUERY_RESULT_64_BIT);
             if (qr == VK_SUCCESS) {
@@ -2071,27 +2085,26 @@ static void RenderFrame(App& app) {
 
         // backface 生存 index 数を CPU に読み出す（直前フレームの結果）
         {
-            void* p = nullptr;
-            vmaMapMemory(app.vk.allocator, app.vk.bfDrawCmdAlloc, &p);
+            void* p = app.vk.bfDrawCmdBuffer.getAllocation().map();
             app.lastBfIndexCount = *reinterpret_cast<uint32_t*>(p);
-            vmaUnmapMemory(app.vk.allocator, app.vk.bfDrawCmdAlloc);
+            app.vk.bfDrawCmdBuffer.getAllocation().unmap();
         }
         {
-            void* p = nullptr;
-            vmaMapMemory(app.vk.allocator, app.vk.cullStatsAlloc, &p);
+            void* p = app.vk.cullStatsBuffer.getAllocation().map();
             uint32_t* stats = reinterpret_cast<uint32_t*>(p);
             app.lastFrustumMeshlets = stats[0];
             app.lastDepthRejectedMeshlets = stats[1];
             app.lastVisibleMeshlets = stats[2];
-            vmaUnmapMemory(app.vk.allocator, app.vk.cullStatsAlloc);
+            app.vk.cullStatsBuffer.getAllocation().unmap();
         }
-        vkResetFences(app.vk.device, 1, &app.vk.fence);
+        CheckVkResult(vkResetFences(Raw(app.vk.device), 1, &fence));
 
         // キューサブミット（コマンドバッファ1つ）
+        VkCommandBuffer submitCmd = Raw(app.vk.cmdBuffers[imgIdx]);
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
-        si.pCommandBuffers    = &app.vk.cmdBuffers[imgIdx];
-        CHECK_VK(vkQueueSubmit(app.vk.queue, 1, &si, app.vk.fence));
+        si.pCommandBuffers    = &submitCmd;
+        CheckVkResult(vkQueueSubmit(Raw(app.vk.queue), 1, &si, Raw(app.vk.fence)));
         app.prevDepthValid = true;
         app.frameParity ^= 1u;
 
@@ -2187,66 +2200,61 @@ static void HandleAndroidCmd(android_app* aApp, int32_t cmd) {
 
 // ---- クリーンアップ ----
 static void Cleanup(App& app) {
-    if (app.vk.device) {
-        vkDeviceWaitIdle(app.vk.device);
+    if (IsValid(app.vk.device)) {
+        CheckVkResult(vkDeviceWaitIdle(Raw(app.vk.device)));
 
-        if (app.vk.fence)      vkDestroyFence(app.vk.device, app.vk.fence, nullptr);
+        app.vk.cmdBuffers.clear();
+        app.vk.fence = nullptr;
 
-        if (app.vk.vertexBuffer)   vmaDestroyBuffer(app.vk.allocator, app.vk.vertexBuffer, app.vk.vertexAlloc);
-        if (app.vk.indexBuffer)    vmaDestroyBuffer(app.vk.allocator, app.vk.indexBuffer, app.vk.indexAlloc);
-
-        if (app.vk.meshletBuffer)  vmaDestroyBuffer(app.vk.allocator, app.vk.meshletBuffer, app.vk.meshletAlloc);
-
-        if (app.vk.queryPool)          vkDestroyQueryPool(app.vk.device, app.vk.queryPool, nullptr);
-
-        if (app.vk.compactIndexBuffer) vmaDestroyBuffer(app.vk.allocator, app.vk.compactIndexBuffer, app.vk.compactIndexAlloc);
-        if (app.vk.bfDrawCmdBuffer)    vmaDestroyBuffer(app.vk.allocator, app.vk.bfDrawCmdBuffer, app.vk.bfDrawCmdAlloc);
-        if (app.vk.cullStatsBuffer)    vmaDestroyBuffer(app.vk.allocator, app.vk.cullStatsBuffer, app.vk.cullStatsAlloc);
-
-        if (app.vk.boneBuffer)             vmaDestroyBuffer(app.vk.allocator, app.vk.boneBuffer, app.vk.boneAlloc);
-
-        if (app.vk.vsSkinPipeline)        vkDestroyPipeline(app.vk.device, app.vk.vsSkinPipeline, nullptr);
-        if (app.vk.vsSkinPipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.vsSkinPipelineLayout, nullptr);
-        if (app.vk.vsSkinDescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.vsSkinDescLayout, nullptr);
-
-        if (app.vk.skinCullLdsPipeline)        vkDestroyPipeline(app.vk.device, app.vk.skinCullLdsPipeline, nullptr);
-        if (app.vk.skinCullLdsPipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.skinCullLdsPipelineLayout, nullptr);
-        if (app.vk.skinCullLdsDescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.skinCullLdsDescLayout, nullptr);
-        if (app.vk.hiZSampler)                 vkDestroySampler(app.vk.device, app.vk.hiZSampler, nullptr);
-        if (app.vk.prevDepthSampler)           vkDestroySampler(app.vk.device, app.vk.prevDepthSampler, nullptr);
-        if (app.vk.hiZSpdPipeline)             vkDestroyPipeline(app.vk.device, app.vk.hiZSpdPipeline, nullptr);
-        if (app.vk.hiZSpdPipelineLayout)       vkDestroyPipelineLayout(app.vk.device, app.vk.hiZSpdPipelineLayout, nullptr);
-        if (app.vk.hiZSpdDescLayout)           vkDestroyDescriptorSetLayout(app.vk.device, app.vk.hiZSpdDescLayout, nullptr);
-        if (app.vk.hiZSpdAtomicBuffer)         vmaDestroyBuffer(app.vk.allocator, app.vk.hiZSpdAtomicBuffer, app.vk.hiZSpdAtomicAlloc);
-        if (app.vk.meshletDebugPipeline)       vkDestroyPipeline(app.vk.device, app.vk.meshletDebugPipeline, nullptr);
-        if (app.vk.meshletDebugPipelineLayout) vkDestroyPipelineLayout(app.vk.device, app.vk.meshletDebugPipelineLayout, nullptr);
-        if (app.vk.meshletDebugDescLayout)     vkDestroyDescriptorSetLayout(app.vk.device, app.vk.meshletDebugDescLayout, nullptr);
+        app.vk.meshletDebugPipeline = nullptr;
+        app.vk.meshletDebugPipelineLayout = nullptr;
+        app.vk.meshletDebugDescLayout = nullptr;
+        app.vk.hiZSpdPipeline = nullptr;
+        app.vk.hiZSpdPipelineLayout = nullptr;
+        app.vk.hiZSpdDescLayout = nullptr;
+        app.vk.hiZSpdAtomicBuffer = nullptr;
+        app.vk.hiZSampler = nullptr;
+        app.vk.prevDepthSampler = nullptr;
+        app.vk.skinCullLdsPipeline = nullptr;
+        app.vk.skinCullLdsPipelineLayout = nullptr;
+        app.vk.skinCullLdsDescLayout = nullptr;
+        app.vk.vsSkinPipeline = nullptr;
+        app.vk.vsSkinPipelineLayout = nullptr;
+        app.vk.vsSkinDescLayout = nullptr;
+        app.vk.boneBuffer = nullptr;
+        app.vk.cullStatsBuffer = nullptr;
+        app.vk.bfDrawCmdBuffer = nullptr;
+        app.vk.compactIndexBuffer = nullptr;
+        app.vk.queryPool = nullptr;
+        app.vk.meshletBuffer = nullptr;
+        app.vk.indexBuffer = nullptr;
+        app.vk.vertexBuffer = nullptr;
 
         for (auto& sc : app.xr.swapchains) {
             for (auto& si : sc.images) {
-                    if (si.view)        vkDestroyImageView(app.vk.device, si.view, nullptr);
+                si.view = nullptr;
             }
             for (uint32_t ping = 0; ping < 2; ++ping) {
-                if (sc.prevDepthViews[ping])   vkDestroyImageView(app.vk.device, sc.prevDepthViews[ping], nullptr);
-                if (sc.prevDepthImages[ping])  vmaDestroyImage(app.vk.allocator, sc.prevDepthImages[ping], sc.prevDepthAllocs[ping]);
-                if (sc.motionViews[ping])      vkDestroyImageView(app.vk.device, sc.motionViews[ping], nullptr);
-                if (sc.motionImages[ping])     vmaDestroyImage(app.vk.allocator, sc.motionImages[ping], sc.motionAllocs[ping]);
-                for (VkImageView v : sc.hiZMipViews[ping]) {
-                    if (v) vkDestroyImageView(app.vk.device, v, nullptr);
-                }
-                if (sc.hiZViews[ping])         vkDestroyImageView(app.vk.device, sc.hiZViews[ping], nullptr);
-                if (sc.hiZImages[ping])        vmaDestroyImage(app.vk.allocator, sc.hiZImages[ping], sc.hiZAllocs[ping]);
+                sc.hiZMipViews[ping].clear();
+                sc.hiZViews[ping] = nullptr;
+                sc.hiZImages[ping] = nullptr;
+                sc.motionViews[ping] = nullptr;
+                sc.motionImages[ping] = nullptr;
+                sc.prevDepthViews[ping] = nullptr;
+                sc.prevDepthImages[ping] = nullptr;
             }
-            if (sc.depthSampleView) vkDestroyImageView(app.vk.device, sc.depthSampleView, nullptr);
-            if (sc.depthView)   vkDestroyImageView(app.vk.device, sc.depthView, nullptr);
-            if (sc.depthImage)  vmaDestroyImage(app.vk.allocator, sc.depthImage, sc.depthAlloc);
+            sc.depthSampleView = nullptr;
+            sc.depthView = nullptr;
+            sc.depthImage = nullptr;
         }
 
-        if (app.vk.cmdPool) vkDestroyCommandPool(app.vk.device, app.vk.cmdPool, nullptr);
-        if (app.vk.allocator) vmaDestroyAllocator(app.vk.allocator);
-        vkDestroyDevice(app.vk.device, nullptr);
+        app.vk.cmdPool = nullptr;
+        app.vk.allocator = nullptr;
+        app.vk.queue = nullptr;
+        app.vk.device = nullptr;
+        app.vk.physDevice = nullptr;
     }
-    if (app.vk.instance) vkDestroyInstance(app.vk.instance, nullptr);
+    app.vk.instance = nullptr;
 
     if (app.xr.appSpace) xrDestroySpace(app.xr.appSpace);
     for (auto& sc : app.xr.swapchains) {

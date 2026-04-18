@@ -26,17 +26,30 @@ endif()
 set(OPENXR_INCLUDE_DIR "${PICO_OPENXR_ROOT}/OpenXR")
 set(OPENXR_LOADER "${PICO_OPENXR_ROOT}/OpenXR/pico/loader/lib/${ANDROID_ABI}/libopenxr_loader.so")
 set(GLM_INCLUDE_DIR "C:/PICO_SDK/3rdParty/glm-0.9.9.8")
-
-# ---- Vulkan Memory Allocator (header-only) ----
+# ---- Vulkan-Headers (Vulkan-Hpp 含む) ----
+# NDK 26.1 同梱の vulkan_enums.hpp は内部で enum 重複定義のバグを抱えているため、
+# Khronos の最新 Vulkan-Headers を FetchContent で取得してそちらを使う。
+# VMA-Hpp v3.3 の要件で Vulkan 1.4.327 以降が必要。
 include(FetchContent)
 FetchContent_Declare(
-    vma
-    GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
-    GIT_TAG        v3.1.0
+    vulkan_headers
+    GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+    GIT_TAG        vulkan-sdk-1.4.341.0
     GIT_SHALLOW    TRUE
 )
-FetchContent_MakeAvailable(vma)
-set(VMA_INCLUDE_DIR "${vma_SOURCE_DIR}/include")
+FetchContent_MakeAvailable(vulkan_headers)
+set(VULKAN_HPP_INCLUDE_DIR "${vulkan_headers_SOURCE_DIR}/include")
+
+# ---- VulkanMemoryAllocator-Hpp (リリース tarball: vk_mem_alloc.h を同梱) ----
+# vma::raii API を使うため v3.3.0+3 を使用。tarball が VMA 本体ヘッダを含むので、
+# VMA を別途 FetchContent する必要はない。
+FetchContent_Declare(
+    vma_hpp
+    URL      https://github.com/YaaZ/VulkanMemoryAllocator-Hpp/releases/download/v3.3.0%2B3/VulkanMemoryAllocator-Hpp-3.3.0.tar.gz
+    URL_HASH SHA256=8c2a0573babe1f86f3241d12b4c9df40bb944649b7f4239c1c611797f8af6cd5
+)
+FetchContent_MakeAvailable(vma_hpp)
+set(VMA_INCLUDE_DIR "${vma_hpp_SOURCE_DIR}")
 
 # ---- glslc（ホスト PC 上で動作するシェーダーコンパイラ）----
 find_program(GLSLC glslc
@@ -111,6 +124,7 @@ add_library(PICOPerformanceTest MODULE
 target_include_directories(PICOPerformanceTest PRIVATE
     "${OPENXR_INCLUDE_DIR}"
     "${GLM_INCLUDE_DIR}"
+    "${VULKAN_HPP_INCLUDE_DIR}"
     "${VMA_INCLUDE_DIR}"
     "${SHADER_GEN_DIR}"
     ${ANDROID_NDK}/sources/android/native_app_glue
@@ -122,6 +136,7 @@ target_compile_definitions(PICOPerformanceTest PRIVATE
     GLM_FORCE_RADIANS
     GLM_FORCE_DEPTH_ZERO_TO_ONE
     GLM_FORCE_CTOR_INIT
+    VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
 )
 
 target_compile_options(PICOPerformanceTest PRIVATE
