@@ -222,13 +222,17 @@ static PFN_xrGetVulkanGraphicsDevice2KHR        pfn_xrGetVulkanGraphicsDevice2KH
 static PFN_xrCreateVulkanDeviceKHR              pfn_xrCreateVulkanDeviceKHR             = nullptr;
 
 // ============================================================
-// Vulkan 拡張関数ポインタ（VK_KHR_dynamic_rendering）
+// Vulkan 拡張関数ポインタ
 // ============================================================
-static PFN_vkCmdBeginRenderingKHR pfn_vkCmdBeginRenderingKHR = nullptr;
-static PFN_vkCmdEndRenderingKHR   pfn_vkCmdEndRenderingKHR   = nullptr;
+static PFN_vkCmdBeginRenderingKHR   pfn_vkCmdBeginRenderingKHR   = nullptr;
+static PFN_vkCmdEndRenderingKHR     pfn_vkCmdEndRenderingKHR     = nullptr;
+static PFN_vkCmdPipelineBarrier2KHR pfn_vkCmdPipelineBarrier2KHR = nullptr;
+static PFN_vkCmdWriteTimestamp2KHR  pfn_vkCmdWriteTimestamp2KHR  = nullptr;
 
-#define vkCmdBeginRenderingKHR pfn_vkCmdBeginRenderingKHR
-#define vkCmdEndRenderingKHR   pfn_vkCmdEndRenderingKHR
+#define vkCmdBeginRenderingKHR   pfn_vkCmdBeginRenderingKHR
+#define vkCmdEndRenderingKHR     pfn_vkCmdEndRenderingKHR
+#define vkCmdPipelineBarrier2KHR pfn_vkCmdPipelineBarrier2KHR
+#define vkCmdWriteTimestamp2KHR  pfn_vkCmdWriteTimestamp2KHR
 
 static void LoadXrExtFunctions(XrInstance instance) {
     CHECK_XR(xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsRequirements2KHR",
@@ -363,22 +367,24 @@ static void TransitionImageLayoutNow(VulkanCtx& vk,
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     CHECK_VK(vkBeginCommandBuffer(cmd, &bi));
 
-    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
+    VkImageMemoryBarrier2KHR barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
+    barrier.srcStageMask        = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR;
+    barrier.srcAccessMask       = 0;
+    barrier.dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    barrier.dstAccessMask       = (newLayout == VK_IMAGE_LAYOUT_GENERAL)
+        ? (VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT_KHR)
+        : 0;
+    barrier.oldLayout           = oldLayout;
+    barrier.newLayout           = newLayout;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange = {aspectMask, 0, mipCount, 0, layerCount};
-    barrier.srcAccessMask = 0;
-    barrier.dstAccessMask = (newLayout == VK_IMAGE_LAYOUT_GENERAL)
-        ? (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)
-        : 0;
+    barrier.image               = image;
+    barrier.subresourceRange    = {aspectMask, 0, mipCount, 0, layerCount};
 
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier);
+    VkDependencyInfoKHR depInfo{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
+    depInfo.imageMemoryBarrierCount = 1;
+    depInfo.pImageMemoryBarriers    = &barrier;
+    vkCmdPipelineBarrier2KHR(cmd, &depInfo);
     CHECK_VK(vkEndCommandBuffer(cmd));
 
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -873,6 +879,7 @@ static void CreateVulkanDevice(App& app) {
     vulkan13Features.subgroupSizeControl  = VK_TRUE;
     vulkan13Features.computeFullSubgroups = VK_TRUE;
     vulkan13Features.dynamicRendering     = VK_TRUE;
+    vulkan13Features.synchronization2     = VK_TRUE;
     multiviewFeatures.pNext = &vulkan13Features;
 
     // multiDrawIndirect feature（drawCount > 1 の indirect draw に必須）
@@ -883,6 +890,7 @@ static void CreateVulkanDevice(App& app) {
         VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME,
         VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
         VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
     };
 
     VkDeviceCreateInfo devCI{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -906,12 +914,17 @@ static void CreateVulkanDevice(App& app) {
 
     vkGetDeviceQueue(app.vk.device, app.vk.queueFamily, 0, &app.vk.queue);
 
-    // VK_KHR_dynamic_rendering 関数ポインタのロード
-    pfn_vkCmdBeginRenderingKHR = reinterpret_cast<PFN_vkCmdBeginRenderingKHR>(
+    // Vulkan 拡張関数ポインタのロード
+    pfn_vkCmdBeginRenderingKHR   = reinterpret_cast<PFN_vkCmdBeginRenderingKHR>(
         vkGetDeviceProcAddr(app.vk.device, "vkCmdBeginRenderingKHR"));
-    pfn_vkCmdEndRenderingKHR   = reinterpret_cast<PFN_vkCmdEndRenderingKHR>(
+    pfn_vkCmdEndRenderingKHR     = reinterpret_cast<PFN_vkCmdEndRenderingKHR>(
         vkGetDeviceProcAddr(app.vk.device, "vkCmdEndRenderingKHR"));
+    pfn_vkCmdPipelineBarrier2KHR = reinterpret_cast<PFN_vkCmdPipelineBarrier2KHR>(
+        vkGetDeviceProcAddr(app.vk.device, "vkCmdPipelineBarrier2KHR"));
+    pfn_vkCmdWriteTimestamp2KHR  = reinterpret_cast<PFN_vkCmdWriteTimestamp2KHR>(
+        vkGetDeviceProcAddr(app.vk.device, "vkCmdWriteTimestamp2KHR"));
     assert(pfn_vkCmdBeginRenderingKHR && pfn_vkCmdEndRenderingKHR);
+    assert(pfn_vkCmdPipelineBarrier2KHR && pfn_vkCmdWriteTimestamp2KHR);
 
     // VMA Allocator 初期化（Vulkan 関数は vkGetInstanceProcAddr 経由で動的ロード）
     VmaVulkanFunctions vmaFns{};
@@ -1768,8 +1781,8 @@ static void RenderStereo(App& app, uint32_t imageIdx,
 
     // t0: CS 開始直前
     if (app.vk.queryPool != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            app.vk.queryPool, TS_CS_BEGIN);
+        vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR,
+                               app.vk.queryPool, TS_CS_BEGIN);
     }
 
     // ---- Compute pass: mode=7 CS LDS skin+cull ----
@@ -1785,13 +1798,17 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     uint32_t cullStatsInit[4] = {0, 0, 0, 0};
     vkCmdUpdateBuffer(cmd, app.vk.cullStatsBuffer, 0, sizeof(cullStatsInit), cullStatsInit);
 
-    VkMemoryBarrier fillToCs{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    fillToCs.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    fillToCs.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &fillToCs, 0, nullptr, 0, nullptr);
+    VkMemoryBarrier2KHR fillToCs{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR};
+    fillToCs.srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR;
+    fillToCs.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR;
+    fillToCs.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    fillToCs.dstAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_READ_BIT_KHR;
+    {
+        VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers    = &fillToCs;
+        vkCmdPipelineBarrier2KHR(cmd, &dep);
+    }
 
     // ---- mode=7: LBS + backface cull、LDS で頂点共有（1 wg = 1 meshlet）----
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.skinCullLdsPipeline);
@@ -1826,83 +1843,91 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     vkCmdPushConstants(cmd, app.vk.skinCullLdsPipelineLayout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lpc), &lpc);
     if (app.prevDepthValid) {
-        VkImageMemoryBarrier prevDepthToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        prevDepthToRead.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        prevDepthToRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        prevDepthToRead.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        prevDepthToRead.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkImageMemoryBarrier2KHR prevDepthToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
+        prevDepthToRead.srcStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        prevDepthToRead.srcAccessMask       = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+        prevDepthToRead.dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        prevDepthToRead.dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT_KHR;
+        prevDepthToRead.oldLayout           = VK_IMAGE_LAYOUT_GENERAL;
+        prevDepthToRead.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
         prevDepthToRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         prevDepthToRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        prevDepthToRead.image = app.xr.swapchains[0].hiZImages[prevDepthReadIdx];
-        prevDepthToRead.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
-                                            app.xr.swapchains[0].hiZMipCount, 0, 2};
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &prevDepthToRead);
+        prevDepthToRead.image               = sc.hiZImages[prevDepthReadIdx];
+        prevDepthToRead.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                               sc.hiZMipCount, 0, 2};
+        VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers    = &prevDepthToRead;
+        vkCmdPipelineBarrier2KHR(cmd, &dep);
     }
     vkCmdDispatch(cmd, app.vk.meshletCount, 1, 1);
 
     // t1: CS 終了（dispatch 完了後）
     if (app.vk.queryPool != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            app.vk.queryPool, TS_CS_END);
+        vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                               app.vk.queryPool, TS_CS_END);
     }
 
     // compute → indirect + index read
-    VkMemoryBarrier csToDraw{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    csToDraw.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    csToDraw.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
-        0, 1, &csToDraw, 0, nullptr, 0, nullptr);
+    VkMemoryBarrier2KHR csToDraw{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR};
+    csToDraw.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    csToDraw.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+    csToDraw.dstStageMask  = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT_KHR
+                           | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT_KHR;
+    csToDraw.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT_KHR
+                           | VK_ACCESS_2_INDEX_READ_BIT_KHR;
+    {
+        VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers    = &csToDraw;
+        vkCmdPipelineBarrier2KHR(cmd, &dep);
+    }
 
     // t2: Graphics pass 開始直前
     if (app.vk.queryPool != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            app.vk.queryPool, TS_GFX_BEGIN);
+        vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR,
+                               app.vk.queryPool, TS_GFX_BEGIN);
     }
 
     // ---- Graphics pass ----
-    // LOAD_OP_CLEAR を使うので全アタッチメントを UNDEFINED から遷移させてよい
+    // LOAD_OP_CLEAR を使うので全アタッチメントを UNDEFINED から ATTACHMENT_OPTIMAL_KHR へ遷移
     {
-        VkImageMemoryBarrier barriers[4]{};
-        // swapchain color
-        barriers[0].sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barriers[0].srcAccessMask       = 0;
-        barriers[0].dstAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        barriers[0].oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
-        barriers[0].newLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[0].image               = sc.images[imageIdx].image;
-        barriers[0].subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
-        // depth
-        barriers[1]                     = barriers[0];
-        barriers[1].dstAccessMask       = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
-                                        | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-        barriers[1].newLayout           = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        barriers[1].image               = sc.depthImage;
-        barriers[1].subresourceRange    = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
-        // prevDepth
-        barriers[2]                     = barriers[0];
-        barriers[2].image               = sc.prevDepthImages[prevDepthWriteIdx];
-        // motion
-        barriers[3]                     = barriers[0];
-        barriers[3].image               = sc.motionImages[prevDepthWriteIdx];
+        VkImageMemoryBarrier2KHR barriers[4]{};
+        for (auto& b : barriers) {
+            b.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR;
+            b.srcStageMask        = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR;
+            b.srcAccessMask       = 0;
+            b.dstStageMask        = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR;
+            b.dstAccessMask       = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR;
+            b.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout           = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        }
+        barriers[0].image            = sc.images[imageIdx].image;
+        barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+        // depth: ATTACHMENT_OPTIMAL_KHR も depth/stencil に使える（unified layout）
+        barriers[1].dstStageMask  = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT_KHR
+                                  | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT_KHR;
+        barriers[1].dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT_KHR
+                                  | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT_KHR;
+        barriers[1].image            = sc.depthImage;
+        barriers[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
+        barriers[2].image            = sc.prevDepthImages[prevDepthWriteIdx];
+        barriers[2].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+        barriers[3].image            = sc.motionImages[prevDepthWriteIdx];
+        barriers[3].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
 
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-            0, 0, nullptr, 0, nullptr, 4, barriers);
+        VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
+        dep.imageMemoryBarrierCount = 4;
+        dep.pImageMemoryBarriers    = barriers;
+        vkCmdPipelineBarrier2KHR(cmd, &dep);
     }
 
     VkRenderingAttachmentInfoKHR colorAtts[3]{};
     colorAtts[0].sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
     colorAtts[0].imageView   = sc.images[imageIdx].view;
-    colorAtts[0].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAtts[0].imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
     colorAtts[0].loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAtts[0].storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
     colorAtts[0].clearValue.color.float32[0] = 0.1f;
@@ -1912,20 +1937,20 @@ static void RenderStereo(App& app, uint32_t imageIdx,
 
     colorAtts[1].sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
     colorAtts[1].imageView   = sc.prevDepthViews[prevDepthWriteIdx];
-    colorAtts[1].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAtts[1].imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
     colorAtts[1].loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAtts[1].storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
     colorAtts[1].clearValue.color.float32[0] = 1.0f;
 
     colorAtts[2].sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
     colorAtts[2].imageView   = sc.motionViews[prevDepthWriteIdx];
-    colorAtts[2].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAtts[2].imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
     colorAtts[2].loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAtts[2].storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
 
     VkRenderingAttachmentInfoKHR depthAtt{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
     depthAtt.imageView              = sc.depthView;
-    depthAtt.imageLayout            = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthAtt.imageLayout            = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
     depthAtt.loadOp                 = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAtt.storeOp                = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAtt.clearValue.depthStencil = {1.0f, 0};
@@ -1978,23 +2003,27 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     vkCmdEndRenderingKHR(cmd);
 
     if (app.vk.queryPool != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                            app.vk.queryPool, TS_GFX_END);
+        vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT_KHR,
+                               app.vk.queryPool, TS_GFX_END);
     }
 
-    VkImageMemoryBarrier depthToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    depthToRead.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    depthToRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    depthToRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    depthToRead.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    VkImageMemoryBarrier2KHR depthToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
+    depthToRead.srcStageMask        = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT_KHR;
+    depthToRead.srcAccessMask       = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT_KHR;
+    depthToRead.dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    depthToRead.dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT_KHR;
+    depthToRead.oldLayout           = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
+    depthToRead.newLayout           = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL_KHR;
     depthToRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     depthToRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    depthToRead.image = app.xr.swapchains[0].depthImage;
-    depthToRead.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &depthToRead);
+    depthToRead.image               = sc.depthImage;
+    depthToRead.subresourceRange    = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
+    {
+        VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers    = &depthToRead;
+        vkCmdPipelineBarrier2KHR(cmd, &dep);
+    }
 
     struct HiZSpdPC {
         uint32_t mips;
@@ -2010,8 +2039,8 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     spdPc.srcHeight = app.xr.swapchains[0].height;
 
     if (app.vk.queryPool != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            app.vk.queryPool, TS_HIZ_BEGIN);
+        vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                               app.vk.queryPool, TS_HIZ_BEGIN);
     }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.hiZSpdPipeline);
@@ -2022,23 +2051,27 @@ static void RenderStereo(App& app, uint32_t imageIdx,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(spdPc), &spdPc);
     vkCmdDispatch(cmd, spdDispatchX, spdDispatchY, 2u);
 
-    VkImageMemoryBarrier hiZBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    hiZBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    hiZBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    hiZBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    hiZBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkImageMemoryBarrier2KHR hiZBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
+    hiZBarrier.srcStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    hiZBarrier.srcAccessMask       = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+    hiZBarrier.dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+    hiZBarrier.dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT_KHR;
+    hiZBarrier.oldLayout           = VK_IMAGE_LAYOUT_GENERAL;
+    hiZBarrier.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
     hiZBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     hiZBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hiZBarrier.image = app.xr.swapchains[0].hiZImages[prevDepthWriteIdx];
-    hiZBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, app.xr.swapchains[0].hiZMipCount, 0, 2};
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &hiZBarrier);
+    hiZBarrier.image               = sc.hiZImages[prevDepthWriteIdx];
+    hiZBarrier.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, sc.hiZMipCount, 0, 2};
+    {
+        VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers    = &hiZBarrier;
+        vkCmdPipelineBarrier2KHR(cmd, &dep);
+    }
 
     if (app.vk.queryPool != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            app.vk.queryPool, TS_HIZ_END);
+        vkCmdWriteTimestamp2KHR(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                               app.vk.queryPool, TS_HIZ_END);
     }
 
     CHECK_VK(vkEndCommandBuffer(cmd));
