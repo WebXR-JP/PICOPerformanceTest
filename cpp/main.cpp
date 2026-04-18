@@ -91,6 +91,7 @@ struct EyeSwapchain {
     VkImage        depthImage  = VK_NULL_HANDLE;
     VkDeviceMemory depthMemory = VK_NULL_HANDLE;
     VkImageView    depthView   = VK_NULL_HANDLE;
+    VkImageView    depthSampleView = VK_NULL_HANDLE;
     VkImage        prevDepthImages[2]  = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDeviceMemory prevDepthMemories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkImageView    prevDepthViews[2]   = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -991,14 +992,14 @@ static void CreateRenderPass(App& app, VkFormat colorFormat) {
     attachments[0].finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
     // デプス
-    attachments[1].format         = VK_FORMAT_D24_UNORM_S8_UINT;
+    attachments[1].format         = VK_FORMAT_D32_SFLOAT;
     attachments[1].samples        = VK_SAMPLE_COUNT_1_BIT;
     attachments[1].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
     attachments[1].storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     attachments[1].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     attachments[1].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-    attachments[1].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    attachments[1].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
     // 前フレーム可視性用の深度キャプチャ
     attachments[2].format         = VK_FORMAT_R32_SFLOAT;
@@ -1403,8 +1404,8 @@ static void CreateHiZSpdPipeline(App& app) {
     for (uint32_t ping = 0; ping < 2; ++ping) {
         VkDescriptorImageInfo srcInfo{};
         srcInfo.sampler = app.vk.prevDepthSampler;
-        srcInfo.imageView = sc.prevDepthViews[ping];
-        srcInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        srcInfo.imageView = sc.depthSampleView;
+        srcInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
         VkDescriptorBufferInfo counterInfo{};
         counterInfo.buffer = app.vk.hiZSpdAtomicBuffer;
@@ -1489,18 +1490,21 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
 
     // デプスバッファ（arrayLayers=2 で両目分）
     CreateImage(app.vk, sc.width, sc.height,
-                VK_FORMAT_D24_UNORM_S8_UINT,
-                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                VK_FORMAT_D32_SFLOAT,
+                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                 sc.depthImage, sc.depthMemory,
                 2 /* arrayLayers=2 */);
 
     VkImageViewCreateInfo dvCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     dvCI.image    = sc.depthImage;
     dvCI.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-    dvCI.format   = VK_FORMAT_D24_UNORM_S8_UINT;
-    dvCI.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+    dvCI.format   = VK_FORMAT_D32_SFLOAT;
+    dvCI.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT,
                              0, 1, 0, 2 /* layerCount=2 */};
     CHECK_VK(vkCreateImageView(app.vk.device, &dvCI, nullptr, &sc.depthView));
+    sc.depthSampleView = CreateImageView(
+        app.vk, sc.depthImage, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT,
+        VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, 1, 0, 2);
 
     for (uint32_t ping = 0; ping < 2; ++ping) {
         CreateImage(app.vk, sc.width, sc.height,
@@ -1826,55 +1830,24 @@ static void RenderStereo(App& app, uint32_t imageIdx,
 
     vkCmdEndRenderPass(cmd);
 
-    VkMemoryBarrier gfxToCapture{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    gfxToCapture.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    gfxToCapture.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-        0, 1, &gfxToCapture, 0, nullptr, 0, nullptr);
-
-    VkRenderPassBeginInfo captureRpBI{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    captureRpBI.renderPass        = app.vk.captureRenderPass;
-    captureRpBI.framebuffer       = fb;
-    captureRpBI.renderArea.offset = {0, 0};
-    captureRpBI.renderArea.extent = {swapW, swapH};
-    captureRpBI.clearValueCount   = 4;
-    captureRpBI.pClearValues      = clears4;
-
-    vkCmdBeginRenderPass(cmd, &captureRpBI, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.vsSkinCapturePipeline);
-    vkCmdPushConstants(cmd, app.vk.vsSkinPipelineLayout,
-                       VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            app.vk.vsSkinPipelineLayout, 0, 1,
-                            &app.vk.vsSkinDescSet, 0, nullptr);
-    vkCmdBindIndexBuffer(cmd, app.vk.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, app.vk.indexCount, (uint32_t)app.instCount, 0, 0, 0);
-    vkCmdEndRenderPass(cmd);
-
     if (app.vk.queryPool != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             app.vk.queryPool, TS_GFX_END);
     }
 
-    VkImageMemoryBarrier downsampleSrcBarriers[1]{};
-    for (uint32_t i = 0; i < 1; ++i) {
-        downsampleSrcBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        downsampleSrcBarriers[i].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        downsampleSrcBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        downsampleSrcBarriers[i].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        downsampleSrcBarriers[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        downsampleSrcBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        downsampleSrcBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        downsampleSrcBarriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
-    }
-    downsampleSrcBarriers[0].image = app.xr.swapchains[0].prevDepthImages[prevDepthWriteIdx];
+    VkImageMemoryBarrier depthToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    depthToRead.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    depthToRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    depthToRead.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    depthToRead.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    depthToRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depthToRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    depthToRead.image = app.xr.swapchains[0].depthImage;
+    depthToRead.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
     vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, downsampleSrcBarriers);
+        0, 0, nullptr, 0, nullptr, 1, &depthToRead);
 
     struct HiZSpdPC {
         uint32_t mips;
