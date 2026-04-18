@@ -155,7 +155,7 @@ void CreateVsSkinPipeline(App& app, uint32_t width, uint32_t height) {
 }
 
 void CreateSkinCullLdsPipeline(App& app) {
-    VkDescriptorSetLayoutBinding bindings[8]{};
+    VkDescriptorSetLayoutBinding bindings[9]{};
     for (uint32_t i = 0; i < 6; i++) {
         bindings[i].binding         = i;
         bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -170,9 +170,13 @@ void CreateSkinCullLdsPipeline(App& app) {
     bindings[7].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[7].descriptorCount = 1;
     bindings[7].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[8].binding         = 8;
+    bindings[8].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[8].descriptorCount = 1;
+    bindings[8].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutCreateInfo dslCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dslCI.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-    dslCI.bindingCount = 8;
+    dslCI.bindingCount = 9;
     dslCI.pBindings    = bindings;
     VkDescriptorSetLayout rawDescLayout = VK_NULL_HANDLE;
     CheckVkResult(vkCreateDescriptorSetLayout(Raw(app.vk.device), &dslCI, nullptr, &rawDescLayout));
@@ -361,7 +365,7 @@ void CreateHiZSpdPipeline(App& app) {
 }
 
 void CreateMeshletDebugPipeline(App& app, uint32_t width, uint32_t height) {
-    VkDescriptorSetLayoutBinding bindings[2]{};
+    VkDescriptorSetLayoutBinding bindings[3]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -370,10 +374,14 @@ void CreateMeshletDebugPipeline(App& app, uint32_t width, uint32_t height) {
     bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[1].descriptorCount = 1;
     bindings[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    bindings[2].binding = 2;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     VkDescriptorSetLayoutCreateInfo dslCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dslCI.flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-    dslCI.bindingCount = 2;
+    dslCI.bindingCount = 3;
     dslCI.pBindings = bindings;
     VkDescriptorSetLayout rawDescLayout = VK_NULL_HANDLE;
     CheckVkResult(vkCreateDescriptorSetLayout(Raw(app.vk.device), &dslCI, nullptr, &rawDescLayout));

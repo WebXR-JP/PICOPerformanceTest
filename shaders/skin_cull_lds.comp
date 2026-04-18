@@ -46,6 +46,7 @@ layout(std430, binding = 4) writeonly buffer DstIdxBuf  { uint      dstIndices[]
 layout(std430, binding = 5) coherent  buffer DrawCmdBuf { DrawCmd   cmd;          };
 layout(binding = 6) uniform sampler2DArray hiZTex;
 layout(std430, binding = 7) coherent buffer CullStatsBuf { uint cullStats[40]; };
+layout(std430, binding = 8) readonly buffer PrevFrameBuf { mat4 prevMvp[2]; } pf;
 // [0..2] counts  [3..10] delta hist  [11] tested
 // [12..17] maxH hist  [18..23] depthLimit hist
 // [24..29] raw Hi-Z probes
@@ -145,17 +146,40 @@ bool aabbOccludedByPrevDepth(vec3 aMin, vec3 aMax) {
         vec2 maxUv = vec2(-1e9);
         float nearestDepth = 0.0;
         bool anyValid = false;
+        // Hi-Z は前フレームの depth から生成されているため、投影も前フレームの MVP で行う。
+        const float kNearMargin = 0.1;  // zNear (0.05) の 2 倍余裕
+        // World-space 距離 bias（一定のマージン、距離に依らない）
+        // ndc.z bias ≈ (zNear*zFar/(zFar-zNear)) * worldBias / w²
+        // zNear=0.05, zFar=100 → factor = 5/99.95 ≈ 0.05
+        const float kWorldBias    = pc.prevDepthParams.z;  // C++ 側で worldBias (m) を設定
+        const float kDepthFactor  = 0.05;
+        bool anyCornerBehind = false;
+        bool anyCornerOffscreen = false;
         for (int i = 0; i < 8; ++i) {
-            vec4 clip = projectClip(corners[i], pc.mvp[eye]);
-            if (clip.w <= 1e-5) continue;
+            vec4 clip = projectClip(corners[i], pf.prevMvp[eye]);
+            if (clip.w <= kNearMargin) {
+                anyCornerBehind = true;
+                continue;
+            }
             vec3 ndc = clip.xyz / clip.w;
             vec2 uv = ndc.xy * 0.5 + 0.5;
+            if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+                anyCornerOffscreen = true;
+            }
             minUv = min(minUv, uv);
             maxUv = max(maxUv, uv);
-            nearestDepth = max(nearestDepth, ndc.z);
+            // 距離依存の ndc.z shift で world-space 一定 bias を実現
+            float ndcZ_shifted = ndc.z + kDepthFactor * kWorldBias / (clip.w * clip.w);
+            nearestDepth = max(nearestDepth, ndcZ_shifted);
             anyValid = true;
         }
         if (!anyValid) {
+            occludedBoth = false;
+            continue;
+        }
+        // AABB が前フレーム frustum から部分的にはみ出していた場合、Hi-Z データ範囲外
+        // を参照しているので遮蔽判定不可と扱う (pop-in 誤カリング防止)
+        if (anyCornerBehind || anyCornerOffscreen) {
             occludedBoth = false;
             continue;
         }
@@ -168,7 +192,8 @@ bool aabbOccludedByPrevDepth(vec3 aMin, vec3 aMax) {
         vec2 hiZSize = max(ceil(pc.prevDepthParams.xy / texelSpanPx), vec2(1.0));
         vec2 texelMin = clamp(floor(rectMin * hiZSize) - vec2(1.0), vec2(0.0), hiZSize - 1.0);
         vec2 texelMax = clamp(ceil(rectMax * hiZSize) + vec2(1.0), vec2(0.0), hiZSize - 1.0);
-        float depthLimit = max(nearestDepth + pc.prevDepthParams.z, 0.0);
+        // World-space bias は既に nearestDepth に組み込み済み
+        float depthLimit = max(nearestDepth, 0.0);
         float minH = 1e9;
         float maxH = 0.0;
         bool hasRendered = false;  // 少なくとも 1 サンプルが実レンダ値 (< 1.0) か
@@ -317,10 +342,14 @@ void main() {
 
         bool keep = true;
         if (pc.cullEnabled != 0u) {
-            vec3 n  = cross(p1 - p0, p2 - p0);
+            vec3 n  = normalize(cross(p1 - p0, p2 - p0));
             vec3 cc = (p0 + p1 + p2) * (1.0 / 3.0);
-            bool backL = dot(cc - pc.camPos[0].xyz, n) > 0.0;
-            bool backR = dot(cc - pc.camPos[1].xyz, n) > 0.0;
+            // silhouette 近辺 (skinning で winding が揺れる領域) を保守的に残す。
+            // 正規化 dot > 0.15 (~8.6°) のみ backface と判定。
+            // skinning amp=8° のため silhouette 付近の誤判定をほぼ吸収。
+            const float kBackBias = 0.15;
+            bool backL = dot(normalize(cc - pc.camPos[0].xyz), n) > kBackBias;
+            bool backR = dot(normalize(cc - pc.camPos[1].xyz), n) > kBackBias;
             keep = !(backL && backR);
         }
 

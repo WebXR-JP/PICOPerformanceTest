@@ -249,6 +249,11 @@ void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  vk.cullStatsBuffer);
 
+    CreateBuffer(vk, sizeof(glm::mat4) * 2u,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 vk.prevFrameBuffer);
+
     vk.totalBones = (uint32_t)(cubeCount * BONES_PER_CUBE);
     VkDeviceSize bSize = sizeof(uint16_t) * 16u * vk.totalBones;
     CreateBuffer(vk, bSize,

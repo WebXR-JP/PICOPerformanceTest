@@ -120,6 +120,7 @@ struct VulkanCtx {
     vma::raii::Buffer                       compactIndexBuffer{nullptr};
     vma::raii::Buffer                       bfDrawCmdBuffer{nullptr};
     vma::raii::Buffer                       cullStatsBuffer{nullptr};
+    vma::raii::Buffer                       prevFrameBuffer{nullptr};  // mat4 prevMvp[2]
     vma::raii::Buffer                       boneBuffer{nullptr};
     uint32_t                                totalBones = 0;
     uint32_t                                vPerFace = 0;
@@ -243,6 +244,7 @@ struct App {
     bool          prevDepthValid   = false;
     glm::vec3     playerPos        = glm::vec3(0.f);
     float         playerYaw        = 0.f;
+    glm::mat4     prevMvpForHiZ[2] = {glm::mat4(1.f), glm::mat4(1.f)};  // 前フレーム Hi-Z 生成時の MVP (再投影用)
     XrTime        lastFrameTime    = 0;
     bool          debugAabbEnabled = true;
 

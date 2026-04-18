@@ -51,6 +51,15 @@ void RenderStereo(App& app, uint32_t imageIdx,
     glm::mat4 mvp0  = ComputeMVP(views[0], model, app.playerPos, app.playerYaw);
     glm::mat4 mvp1  = ComputeMVP(views[1], model, app.playerPos, app.playerYaw);
 
+    // Hi-Z は前フレームの depth。cull shader はこのバッファ経由で
+    // 「前フレーム MVP」を取得してサンプル位置を計算する。
+    {
+        void* p = app.vk.prevFrameBuffer.getAllocation().map();
+        std::memcpy(p,                           &app.prevMvpForHiZ[0], sizeof(glm::mat4));
+        std::memcpy((char*)p + sizeof(glm::mat4), &app.prevMvpForHiZ[1], sizeof(glm::mat4));
+        app.vk.prevFrameBuffer.getAllocation().unmap();
+    }
+
 
     if (IsValid(app.vk.queryPool)) {
         vkCmdResetQueryPool(cmd, Raw(app.vk.queryPool), 0, TS_COUNT);
@@ -86,7 +95,7 @@ void RenderStereo(App& app, uint32_t imageIdx,
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, Raw(app.vk.skinCullLdsPipeline));
     {
-        VkDescriptorBufferInfo bufs[7] = {
+        VkDescriptorBufferInfo bufs[8] = {
             {Raw(app.vk.meshletBuffer),      0, VK_WHOLE_SIZE},
             {Raw(app.vk.vertexBuffer),       0, VK_WHOLE_SIZE},
             {Raw(app.vk.boneBuffer),         0, VK_WHOLE_SIZE},
@@ -94,12 +103,13 @@ void RenderStereo(App& app, uint32_t imageIdx,
             {Raw(app.vk.compactIndexBuffer), 0, VK_WHOLE_SIZE},
             {Raw(app.vk.bfDrawCmdBuffer),    0, VK_WHOLE_SIZE},
             {Raw(app.vk.cullStatsBuffer),    0, VK_WHOLE_SIZE},
+            {Raw(app.vk.prevFrameBuffer),    0, VK_WHOLE_SIZE},
         };
         VkDescriptorImageInfo hiZImg{};
         hiZImg.sampler     = Raw(app.vk.hiZSampler);
         hiZImg.imageView   = Raw(sc.hiZViews[prevDepthReadIdx]);
         hiZImg.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkWriteDescriptorSet w[8]{};
+        VkWriteDescriptorSet w[9]{};
         for (uint32_t i = 0; i < 6; i++) {
             w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w[i].dstBinding      = i;
@@ -117,8 +127,13 @@ void RenderStereo(App& app, uint32_t imageIdx,
         w[7].descriptorCount = 1;
         w[7].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         w[7].pBufferInfo     = &bufs[6];
+        w[8] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[8].dstBinding      = 8;
+        w[8].descriptorCount = 1;
+        w[8].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[8].pBufferInfo     = &bufs[7];
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                  Raw(app.vk.skinCullLdsPipelineLayout), 0, 8, w);
+                                  Raw(app.vk.skinCullLdsPipelineLayout), 0, 9, w);
     }
 
     struct SkinCullLdsPC {
@@ -145,7 +160,8 @@ void RenderStereo(App& app, uint32_t imageIdx,
     lpc.cullEnabled  = 1u;  // meshlet + triangle backface cull
     lpc.frustumEnabled = (uint32_t)app.mode7Frustum;
     lpc.prevDepthEnabled = app.prevDepthValid ? 1u : 0u;
-    lpc.prevDepthParams = glm::vec4((float)swapW, (float)swapH, 0.0003f,
+    // prevDepthParams.z = world-space bias in meters (距離不問で一定のマージン)
+    lpc.prevDepthParams = glm::vec4((float)swapW, (float)swapH, 0.10f,
                                     (float)app.xr.swapchains[0].hiZMipCount);
     vkCmdPushConstants(cmd, Raw(app.vk.skinCullLdsPipelineLayout),
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lpc), &lpc);
@@ -305,16 +321,17 @@ void RenderStereo(App& app, uint32_t imageIdx,
         } dbgPc{};
         dbgPc.mvp[0] = mvp0;
         dbgPc.mvp[1] = mvp1;
-        dbgPc.viewportAndBias = glm::vec4((float)swapW, (float)swapH, 0.0003f,
+        dbgPc.viewportAndBias = glm::vec4((float)swapW, (float)swapH, 0.10f,
                                           (float)app.xr.swapchains[0].hiZMipCount);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Raw(app.vk.meshletDebugPipeline));
         {
             VkDescriptorBufferInfo meshletBuf{Raw(app.vk.meshletBuffer), 0, VK_WHOLE_SIZE};
+            VkDescriptorBufferInfo prevFrameBuf{Raw(app.vk.prevFrameBuffer), 0, VK_WHOLE_SIZE};
             VkDescriptorImageInfo hiZImg{};
             hiZImg.sampler     = Raw(app.vk.hiZSampler);
             hiZImg.imageView   = Raw(sc.hiZViews[prevDepthReadIdx]);
             hiZImg.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            VkWriteDescriptorSet w[2]{};
+            VkWriteDescriptorSet w[3]{};
             w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w[0].dstBinding      = 0;
             w[0].descriptorCount = 1;
@@ -325,8 +342,13 @@ void RenderStereo(App& app, uint32_t imageIdx,
             w[1].descriptorCount = 1;
             w[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             w[1].pImageInfo      = &hiZImg;
+            w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[2].dstBinding      = 2;
+            w[2].descriptorCount = 1;
+            w[2].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w[2].pBufferInfo     = &prevFrameBuf;
             vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                      Raw(app.vk.meshletDebugPipelineLayout), 0, 2, w);
+                                      Raw(app.vk.meshletDebugPipelineLayout), 0, 3, w);
         }
         vkCmdPushConstants(cmd, Raw(app.vk.meshletDebugPipelineLayout),
                            VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(dbgPc), &dbgPc);
@@ -482,6 +504,10 @@ void RenderStereo(App& app, uint32_t imageIdx,
     }
 
     CheckVkResult(vkEndCommandBuffer(cmd));
+
+    // 次フレームの reprojection 用に、今フレームの MVP (この frame の Hi-Z 生成根拠) を保存
+    app.prevMvpForHiZ[0] = mvp0;
+    app.prevMvpForHiZ[1] = mvp1;
 }
 
 void RenderFrame(App& app) {
@@ -542,12 +568,11 @@ void RenderFrame(App& app) {
         VkFence fence = Raw(app.vk.fence);
         CheckVkResult(vkWaitForFences(Raw(app.vk.device), 1, &fence, VK_TRUE, UINT64_MAX));
 
-        // Skinning disabled for culling debug — bones stay at init-time identity
-        // {
-        //     double elapsed = std::chrono::duration<double>(
-        //         App::Clock::now() - app.startTime).count();
-        //     UpdateBones(app.vk, (float)elapsed);
-        // }
+        {
+            double elapsed = std::chrono::duration<double>(
+                App::Clock::now() - app.startTime).count();
+            UpdateBones(app.vk, (float)elapsed);
+        }
 
         if (IsValid(app.vk.queryPool)) {
             uint64_t ts[TS_COUNT] = {};

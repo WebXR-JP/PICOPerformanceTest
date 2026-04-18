@@ -10,6 +10,7 @@ struct Meshlet {
 
 layout(std430, binding = 0) readonly buffer MeshletBuf { Meshlet meshlets[]; };
 layout(binding = 1) uniform sampler2DArray hiZTex;
+layout(std430, binding = 2) readonly buffer PrevFrameBuf { mat4 prevMvp[2]; } pf;
 
 layout(push_constant) uniform PC {
     mat4 mvp[2];
@@ -56,17 +57,25 @@ bool occludedForEye(Meshlet m, uint eye) {
     vec2 maxUv = vec2(-1e9);
     float nearestDepth = 0.0;
     bool anyValid = false;
+    const float kNearMargin  = 0.1;
+    const float kWorldBias   = pc.viewportAndBias.z;
+    const float kDepthFactor = 0.05;
+    bool anyBehind = false, anyOffscreen = false;
     for (int i = 0; i < 8; ++i) {
-        vec4 clip = pc.mvp[eye] * vec4(cornerOf(m, i), 1.0);
-        if (clip.w <= 1e-5) continue;
+        vec4 clip = pf.prevMvp[eye] * vec4(cornerOf(m, i), 1.0);
+        if (clip.w <= kNearMargin) { anyBehind = true; continue; }
         vec3 ndc = clip.xyz / clip.w;
         vec2 uv = ndc.xy * 0.5 + 0.5;
+        if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+            anyOffscreen = true;
+        }
         minUv = min(minUv, uv);
         maxUv = max(maxUv, uv);
-        nearestDepth = max(nearestDepth, ndc.z);
+        float ndcZ_shifted = ndc.z + kDepthFactor * kWorldBias / (clip.w * clip.w);
+        nearestDepth = max(nearestDepth, ndcZ_shifted);
         anyValid = true;
     }
-    if (!anyValid) return false;
+    if (!anyValid || anyBehind || anyOffscreen) return false;
     vec2 rectMin = clamp(minUv, vec2(0.0), vec2(1.0));
     vec2 rectMax = clamp(maxUv, vec2(0.0), vec2(1.0));
     vec2 rectSizePx = max((rectMax - rectMin) * pc.viewportAndBias.xy, vec2(1.0));
@@ -75,7 +84,7 @@ bool occludedForEye(Meshlet m, uint eye) {
     vec2 hiZSize = max(ceil(pc.viewportAndBias.xy / texelSpanPx), vec2(1.0));
     vec2 texelMin = clamp(floor(rectMin * hiZSize) - vec2(1.0), vec2(0.0), hiZSize - 1.0);
     vec2 texelMax = clamp(ceil(rectMax * hiZSize) + vec2(1.0), vec2(0.0), hiZSize - 1.0);
-    float depthLimit = max(nearestDepth + pc.viewportAndBias.z, 0.0);
+    float depthLimit = max(nearestDepth, 0.0);
     bool hasRendered = false;
     for (int ty = int(texelMin.y); ty <= int(texelMax.y); ++ty) {
         for (int tx = int(texelMin.x); tx <= int(texelMax.x); ++tx) {
