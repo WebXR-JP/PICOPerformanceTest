@@ -105,6 +105,11 @@ target_link_libraries(app_glue PUBLIC android log)
 # ---- メインターゲット ----
 add_library(PICOPerformanceTest MODULE
     cpp/main.cpp
+    cpp/vk_resources.cpp
+    cpp/mesh.cpp
+    cpp/openxr_setup.cpp
+    cpp/pipelines.cpp
+    cpp/render.cpp
     # シェーダーヘッダーを依存として追加（カスタムコマンドを確実にトリガーする）
     "${SHADER_GEN_DIR}/vertex_spv.h"
     "${SHADER_GEN_DIR}/fragment_spv.h"
