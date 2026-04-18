@@ -44,7 +44,7 @@ layout(std430, binding = 2) readonly  buffer BoneBuf    { float16_t boneData[]; 
 layout(std430, binding = 3) readonly  buffer SrcIdxBuf  { uint      srcIndices[]; };
 layout(std430, binding = 4) writeonly buffer DstIdxBuf  { uint      dstIndices[]; };
 layout(std430, binding = 5) coherent  buffer DrawCmdBuf { DrawCmd   cmd;          };
-layout(binding = 6) uniform sampler2DArray prevDepthTex;
+layout(binding = 6) uniform sampler2DArray hiZTex;
 
 layout(push_constant) uniform PC {
     mat4 mvp[2];
@@ -53,7 +53,7 @@ layout(push_constant) uniform PC {
     uint cullEnabled;
     uint frustumEnabled;
     uint prevDepthEnabled;
-    vec4 prevDepthParams; // x=width, y=height, z=bias
+    vec4 prevDepthParams; // x=width, y=height, z=bias, w=hiZ mip count
 } pc;
 
 shared f16vec4 s_pos[LOCAL_VERTS];
@@ -87,9 +87,14 @@ vec4 projectClip(vec3 p, mat4 m) {
     return m * vec4(p, 1.0);
 }
 
-bool sampleOccluded(uint eye, vec2 uv, float nearestDepth) {
-    float prevDepth = texture(prevDepthTex, vec3(clamp(uv, vec2(0.0), vec2(1.0)), float(eye))).r;
-    return prevDepth < min(nearestDepth - pc.prevDepthParams.z, 1.0);
+float sampleHiZ(uint eye, vec2 uv, float lod) {
+    return textureLod(hiZTex, vec3(clamp(uv, vec2(0.0), vec2(1.0)), float(eye)), lod).r;
+}
+
+float chooseHiZMip(vec2 rectSizePx) {
+    float maxExtentHiZ = max(max(rectSizePx.x, rectSizePx.y) * 0.5, 1.0);
+    float maxMip = max(pc.prevDepthParams.w - 1.0, 0.0);
+    return clamp(max(ceil(log2(maxExtentHiZ)) - 1.0, 0.0), 0.0, maxMip);
 }
 
 bool aabbOccludedByPrevDepth(vec3 aMin, vec3 aMax) {
@@ -123,14 +128,25 @@ bool aabbOccludedByPrevDepth(vec3 aMin, vec3 aMax) {
             occludedBoth = false;
             continue;
         }
-        vec2 centerUv = clamp((minUv + maxUv) * 0.5, vec2(0.0), vec2(1.0));
-        vec2 rectMin = clamp(minUv - vec2(1.0) / pc.prevDepthParams.xy, vec2(0.0), vec2(1.0));
-        vec2 rectMax = clamp(maxUv + vec2(1.0) / pc.prevDepthParams.xy, vec2(0.0), vec2(1.0));
-        bool occludedEye = sampleOccluded(eye, centerUv, nearestDepth)
-                        && sampleOccluded(eye, vec2(rectMin.x, rectMin.y), nearestDepth)
-                        && sampleOccluded(eye, vec2(rectMax.x, rectMin.y), nearestDepth)
-                        && sampleOccluded(eye, vec2(rectMin.x, rectMax.y), nearestDepth)
-                        && sampleOccluded(eye, vec2(rectMax.x, rectMax.y), nearestDepth);
+        vec2 rectMin = clamp(minUv, vec2(0.0), vec2(1.0));
+        vec2 rectMax = clamp(maxUv, vec2(0.0), vec2(1.0));
+        vec2 rectSizePx = max((rectMax - rectMin) * pc.prevDepthParams.xy, vec2(1.0));
+        float lod = chooseHiZMip(rectSizePx);
+        float texelSpanPx = exp2(lod + 1.0);
+        vec2 hiZSize = max(ceil(pc.prevDepthParams.xy / texelSpanPx), vec2(1.0));
+        vec2 texelMin = clamp(floor(rectMin * hiZSize) - vec2(1.0), vec2(0.0), hiZSize - 1.0);
+        vec2 texelMax = clamp(ceil(rectMax * hiZSize) + vec2(1.0), vec2(0.0), hiZSize - 1.0);
+        float depthLimit = min(nearestDepth - pc.prevDepthParams.z, 1.0);
+        bool occludedEye = true;
+        for (int ty = int(texelMin.y); ty <= int(texelMax.y) && occludedEye; ++ty) {
+            for (int tx = int(texelMin.x); tx <= int(texelMax.x); ++tx) {
+                vec2 uv = (vec2(float(tx), float(ty)) + vec2(0.5)) / hiZSize;
+                if (sampleHiZ(eye, uv, lod) >= depthLimit) {
+                    occludedEye = false;
+                    break;
+                }
+            }
+        }
         occludedBoth = occludedBoth && occludedEye;
     }
     return occludedBoth;

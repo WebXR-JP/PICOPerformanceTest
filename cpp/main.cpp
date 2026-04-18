@@ -99,6 +99,7 @@ struct EyeSwapchain {
     VkImageView    motionViews[2]      = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkImage        hiZImages[2]        = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDeviceMemory hiZMemories[2]      = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImageView    hiZViews[2]         = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     std::vector<VkImageView> hiZMipViews[2];
     uint32_t       hiZW                = 0;
     uint32_t       hiZH                = 0;
@@ -113,6 +114,7 @@ struct VulkanCtx {
     VkQueue          queue          = VK_NULL_HANDLE;
     VkCommandPool    cmdPool        = VK_NULL_HANDLE;
     VkRenderPass     renderPass     = VK_NULL_HANDLE;
+    VkRenderPass     captureRenderPass = VK_NULL_HANDLE;
     VkBuffer         vertexBuffer   = VK_NULL_HANDLE;
     VkDeviceMemory   vertexMemory   = VK_NULL_HANDLE;
     VkBuffer         indexBuffer    = VK_NULL_HANDLE;
@@ -150,6 +152,7 @@ struct VulkanCtx {
     VkDescriptorSet       vsSkinDescSet         = VK_NULL_HANDLE;
     VkPipelineLayout      vsSkinPipelineLayout  = VK_NULL_HANDLE;
     VkPipeline            vsSkinPipeline        = VK_NULL_HANDLE;
+    VkPipeline            vsSkinCapturePipeline = VK_NULL_HANDLE;
 
     // ---- mode=7: CS LDS skin+cull（1 workgroup = 1 meshlet）----
     VkDescriptorSetLayout skinCullLdsDescLayout    = VK_NULL_HANDLE;
@@ -158,6 +161,7 @@ struct VulkanCtx {
     VkPipelineLayout      skinCullLdsPipelineLayout = VK_NULL_HANDLE;
     VkPipeline            skinCullLdsPipeline      = VK_NULL_HANDLE;
     VkSampler             prevDepthSampler         = VK_NULL_HANDLE;
+    VkSampler             hiZSampler               = VK_NULL_HANDLE;
     VkBuffer              hiZSpdAtomicBuffer       = VK_NULL_HANDLE;
     VkDeviceMemory        hiZSpdAtomicMemory       = VK_NULL_HANDLE;
     VkDescriptorSetLayout hiZSpdDescLayout         = VK_NULL_HANDLE;
@@ -708,6 +712,8 @@ struct App {
     double        lastDownsampleMs = 0.0; // 前フレームの Hi-Z 時間（ms）
     uint32_t      frameParity      = 0;
     bool          prevDepthValid   = false;
+    bool          frozenViewsValid = false;
+    XrView        frozenViews[2]   = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 
     // フレーム計測
     using Clock = std::chrono::high_resolution_clock;
@@ -1055,6 +1061,23 @@ static void CreateRenderPass(App& app, VkFormat colorFormat) {
     rpCI.dependencyCount = 1;
     rpCI.pDependencies   = &dep;
     CHECK_VK(vkCreateRenderPass(app.vk.device, &rpCI, nullptr, &app.vk.renderPass));
+
+    VkAttachmentDescription captureAttachments[4] = {};
+    captureAttachments[0] = attachments[0];
+    captureAttachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    captureAttachments[1] = attachments[1];
+    captureAttachments[2] = attachments[2];
+    captureAttachments[3] = attachments[3];
+
+    VkRenderPassCreateInfo captureRpCI{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    captureRpCI.pNext           = &multiviewCI;
+    captureRpCI.attachmentCount = 4;
+    captureRpCI.pAttachments    = captureAttachments;
+    captureRpCI.subpassCount    = 1;
+    captureRpCI.pSubpasses      = &subpass;
+    captureRpCI.dependencyCount = 1;
+    captureRpCI.pDependencies   = &dep;
+    CHECK_VK(vkCreateRenderPass(app.vk.device, &captureRpCI, nullptr, &app.vk.captureRenderPass));
 }
 
 static void CreateQueryPool(App& app) {
@@ -1191,6 +1214,13 @@ static void CreateVsSkinPipeline(App& app, uint32_t width, uint32_t height) {
     CHECK_VK(vkCreateGraphicsPipelines(
         app.vk.device, VK_NULL_HANDLE, 1, &gpCI, nullptr, &app.vk.vsSkinPipeline));
 
+    cbAtt[0].colorWriteMask = 0;
+    cbAtt[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+    cbAtt[2].colorWriteMask = 0;
+    gpCI.renderPass         = app.vk.captureRenderPass;
+    CHECK_VK(vkCreateGraphicsPipelines(
+        app.vk.device, VK_NULL_HANDLE, 1, &gpCI, nullptr, &app.vk.vsSkinCapturePipeline));
+
     vkDestroyShaderModule(app.vk.device, vertMod, nullptr);
     vkDestroyShaderModule(app.vk.device, fragMod, nullptr);
     LOGI("GraphicsPipeline (VS-skin mode=5) created");
@@ -1237,6 +1267,9 @@ static void CreateSkinCullLdsPipeline(App& app) {
     samplerCI.maxLod = 0.0f;
     CHECK_VK(vkCreateSampler(app.vk.device, &samplerCI, nullptr, &app.vk.prevDepthSampler));
 
+    samplerCI.maxLod = (float)std::max<int32_t>((int32_t)app.xr.swapchains[0].hiZMipCount - 1, 0);
+    CHECK_VK(vkCreateSampler(app.vk.device, &samplerCI, nullptr, &app.vk.hiZSampler));
+
     VkDescriptorSetLayout setLayouts[2] = {
         app.vk.skinCullLdsDescLayout,
         app.vk.skinCullLdsDescLayout,
@@ -1258,9 +1291,9 @@ static void CreateSkinCullLdsPipeline(App& app) {
         { app.vk.bfDrawCmdBuffer,    0, VK_WHOLE_SIZE },
         };
         VkDescriptorImageInfo imageInfo{};
-        imageInfo.sampler = app.vk.prevDepthSampler;
-        imageInfo.imageView = sc.prevDepthViews[setIdx];
-        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageInfo.sampler = app.vk.hiZSampler;
+        imageInfo.imageView = sc.hiZViews[setIdx];
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkWriteDescriptorSet writes[7]{};
         for (uint32_t i = 0; i < 6; i++) {
@@ -1497,6 +1530,9 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                     sc.hiZImages[ping], sc.hiZMemories[ping],
                     2 /* arrayLayers=2 */, sc.hiZMipCount);
+        sc.hiZViews[ping] = CreateImageView(
+            app.vk, sc.hiZImages[ping], VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, sc.hiZMipCount, 0, 2);
         sc.hiZMipViews[ping].resize(sc.hiZMipCount);
         for (uint32_t level = 0; level < sc.hiZMipCount; ++level) {
             sc.hiZMipViews[ping][level] = CreateImageView(
@@ -1704,21 +1740,23 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     lpc.cullEnabled  = 1u;
     lpc.frustumEnabled = (uint32_t)app.mode7Frustum;
     lpc.prevDepthEnabled = app.prevDepthValid ? 1u : 0u;
-    lpc.prevDepthParams = glm::vec4((float)swapW, (float)swapH, 0.0025f, 0.0f);
+    lpc.prevDepthParams = glm::vec4((float)swapW, (float)swapH, 0.02f,
+                                    (float)app.xr.swapchains[0].hiZMipCount);
     vkCmdPushConstants(cmd, app.vk.skinCullLdsPipelineLayout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lpc), &lpc);
     if (app.prevDepthValid) {
         VkImageMemoryBarrier prevDepthToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        prevDepthToRead.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        prevDepthToRead.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         prevDepthToRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        prevDepthToRead.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        prevDepthToRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        prevDepthToRead.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        prevDepthToRead.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         prevDepthToRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         prevDepthToRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        prevDepthToRead.image = app.xr.swapchains[0].prevDepthImages[prevDepthReadIdx];
-        prevDepthToRead.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+        prevDepthToRead.image = app.xr.swapchains[0].hiZImages[prevDepthReadIdx];
+        prevDepthToRead.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                            app.xr.swapchains[0].hiZMipCount, 0, 2};
         vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &prevDepthToRead);
     }
@@ -1788,7 +1826,34 @@ static void RenderStereo(App& app, uint32_t imageIdx,
 
     vkCmdEndRenderPass(cmd);
 
-    // t3: Graphics pass 終了直後
+    VkMemoryBarrier gfxToCapture{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    gfxToCapture.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    gfxToCapture.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+        0, 1, &gfxToCapture, 0, nullptr, 0, nullptr);
+
+    VkRenderPassBeginInfo captureRpBI{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    captureRpBI.renderPass        = app.vk.captureRenderPass;
+    captureRpBI.framebuffer       = fb;
+    captureRpBI.renderArea.offset = {0, 0};
+    captureRpBI.renderArea.extent = {swapW, swapH};
+    captureRpBI.clearValueCount   = 4;
+    captureRpBI.pClearValues      = clears4;
+
+    vkCmdBeginRenderPass(cmd, &captureRpBI, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, app.vk.vsSkinCapturePipeline);
+    vkCmdPushConstants(cmd, app.vk.vsSkinPipelineLayout,
+                       VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            app.vk.vsSkinPipelineLayout, 0, 1,
+                            &app.vk.vsSkinDescSet, 0, nullptr);
+    vkCmdBindIndexBuffer(cmd, app.vk.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(cmd, app.vk.indexCount, (uint32_t)app.instCount, 0, 0, 0);
+    vkCmdEndRenderPass(cmd);
+
     if (app.vk.queryPool != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             app.vk.queryPool, TS_GFX_END);
@@ -1884,6 +1949,13 @@ static void RenderFrame(App& app) {
         XrViewState vs{XR_TYPE_VIEW_STATE};
         CHECK_XR(xrLocateViews(app.xr.session, &vli, &vs,
                                viewCount, &viewCount, views.data()));
+        if (!app.frozenViewsValid && viewCount == 2) {
+            app.frozenViews[0] = views[0];
+            app.frozenViews[1] = views[1];
+            app.frozenViewsValid = true;
+            LOGI("Frozen render views captured");
+        }
+        const XrView* renderViews = app.frozenViewsValid ? app.frozenViews : views.data();
 
         projViews.resize(viewCount);
 
@@ -1899,13 +1971,17 @@ static void RenderFrame(App& app) {
         CHECK_XR(xrWaitSwapchainImage(sc.handle, &waitInfo));
 
         // 両目まとめて描画
-        RenderStereo(app, imgIdx, views, sc.width, sc.height);
+        std::vector<XrView> renderViewsVec(viewCount, {XR_TYPE_VIEW});
+        for (uint32_t eye = 0; eye < viewCount; ++eye) {
+            renderViewsVec[eye] = renderViews[eye];
+        }
+        RenderStereo(app, imgIdx, renderViewsVec, sc.width, sc.height);
 
         // ProjectionView を設定（左右眼それぞれ、arrayIndex で layer を指定）
         for (uint32_t eye = 0; eye < viewCount; eye++) {
             projViews[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-            projViews[eye].pose = views[eye].pose;
-            projViews[eye].fov  = views[eye].fov;
+            projViews[eye].pose = renderViews[eye].pose;
+            projViews[eye].fov  = renderViews[eye].fov;
             projViews[eye].subImage.swapchain             = sc.handle;
             projViews[eye].subImage.imageRect.offset      = {0, 0};
             projViews[eye].subImage.imageRect.extent      = {(int32_t)sc.width, (int32_t)sc.height};
@@ -2051,6 +2127,7 @@ static void Cleanup(App& app) {
         vkDeviceWaitIdle(app.vk.device);
 
         if (app.vk.fence)      vkDestroyFence(app.vk.device, app.vk.fence, nullptr);
+        if (app.vk.captureRenderPass) vkDestroyRenderPass(app.vk.device, app.vk.captureRenderPass, nullptr);
         if (app.vk.renderPass) vkDestroyRenderPass(app.vk.device, app.vk.renderPass, nullptr);
 
         if (app.vk.vertexBuffer)   vkDestroyBuffer(app.vk.device, app.vk.vertexBuffer, nullptr);
@@ -2072,6 +2149,7 @@ static void Cleanup(App& app) {
         if (app.vk.boneMemory)             vkFreeMemory(app.vk.device, app.vk.boneMemory, nullptr);
 
         if (app.vk.vsSkinPipeline)        vkDestroyPipeline(app.vk.device, app.vk.vsSkinPipeline, nullptr);
+        if (app.vk.vsSkinCapturePipeline) vkDestroyPipeline(app.vk.device, app.vk.vsSkinCapturePipeline, nullptr);
         if (app.vk.vsSkinPipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.vsSkinPipelineLayout, nullptr);
         if (app.vk.vsSkinDescPool)        vkDestroyDescriptorPool(app.vk.device, app.vk.vsSkinDescPool, nullptr);
         if (app.vk.vsSkinDescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.vsSkinDescLayout, nullptr);
@@ -2080,6 +2158,7 @@ static void Cleanup(App& app) {
         if (app.vk.skinCullLdsPipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.skinCullLdsPipelineLayout, nullptr);
         if (app.vk.skinCullLdsDescPool)        vkDestroyDescriptorPool(app.vk.device, app.vk.skinCullLdsDescPool, nullptr);
         if (app.vk.skinCullLdsDescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.skinCullLdsDescLayout, nullptr);
+        if (app.vk.hiZSampler)                 vkDestroySampler(app.vk.device, app.vk.hiZSampler, nullptr);
         if (app.vk.prevDepthSampler)           vkDestroySampler(app.vk.device, app.vk.prevDepthSampler, nullptr);
         if (app.vk.hiZSpdPipeline)             vkDestroyPipeline(app.vk.device, app.vk.hiZSpdPipeline, nullptr);
         if (app.vk.hiZSpdPipelineLayout)       vkDestroyPipelineLayout(app.vk.device, app.vk.hiZSpdPipelineLayout, nullptr);
@@ -2105,6 +2184,7 @@ static void Cleanup(App& app) {
                 for (VkImageView v : sc.hiZMipViews[ping]) {
                     if (v) vkDestroyImageView(app.vk.device, v, nullptr);
                 }
+                if (sc.hiZViews[ping])         vkDestroyImageView(app.vk.device, sc.hiZViews[ping], nullptr);
                 if (sc.hiZImages[ping])        vkDestroyImage(app.vk.device, sc.hiZImages[ping], nullptr);
                 if (sc.hiZMemories[ping])      vkFreeMemory(app.vk.device, sc.hiZMemories[ping], nullptr);
             }
