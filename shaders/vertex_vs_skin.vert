@@ -26,7 +26,11 @@ mat4 getBone(uint idx) {
 layout(push_constant) uniform PushConstants {
     mat4 mvp[2];
     int  aluIters;
+    int  vPerFace;
+    int  vPerCube;
 } pc;
+
+layout(location = 0) out vec3 vColor;
 
 void main() {
     FatVertex v = verts[gl_VertexIndex];
@@ -43,4 +47,11 @@ void main() {
         dummy += sin(float(i) * 0.001 + skinned.x);
     }
     gl_Position = pc.mvp[gl_ViewIndex] * vec4(skinned, 1.0) + vec4(dummy * 0.000001, 0.0, 0.0, 0.0);
+
+    uint cubeId = uint(gl_VertexIndex) / uint(pc.vPerCube);
+    uint faceId = (uint(gl_VertexIndex) / uint(pc.vPerFace)) % 6u;
+    float h = fract(float(cubeId) * 0.61803398875);
+    vec3 base = 0.5 + 0.5 * cos(6.2831853 * (h + vec3(0.0, 0.33, 0.67)));
+    const float faceShade[6] = float[6](1.00, 0.55, 0.85, 0.70, 0.90, 0.65);
+    vColor = base * faceShade[faceId];
 }

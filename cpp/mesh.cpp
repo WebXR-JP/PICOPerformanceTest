@@ -189,6 +189,8 @@ void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
         }
     }
     vk.meshletCount = (uint32_t)totalMeshlets;
+    vk.vPerFace = (uint32_t)vPerFace;
+    vk.vPerCube = (uint32_t)vPerCube;
 
     vk.vertexCount = (uint32_t)totalVerts;
     vk.indexCount  = (uint32_t)totalIdx;
@@ -236,7 +238,7 @@ void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  vk.bfDrawCmdBuffer);
 
-    CreateBuffer(vk, sizeof(uint32_t) * 4u,
+    CreateBuffer(vk, sizeof(uint32_t) * 40u,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  vk.cullStatsBuffer);

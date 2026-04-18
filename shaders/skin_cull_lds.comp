@@ -45,7 +45,11 @@ layout(std430, binding = 3) readonly  buffer SrcIdxBuf  { uint      srcIndices[]
 layout(std430, binding = 4) writeonly buffer DstIdxBuf  { uint      dstIndices[]; };
 layout(std430, binding = 5) coherent  buffer DrawCmdBuf { DrawCmd   cmd;          };
 layout(binding = 6) uniform sampler2DArray hiZTex;
-layout(std430, binding = 7) coherent buffer CullStatsBuf { uint cullStats[4]; };
+layout(std430, binding = 7) coherent buffer CullStatsBuf { uint cullStats[40]; };
+// [0..2] counts  [3..10] delta hist  [11] tested
+// [12..17] maxH hist  [18..23] depthLimit hist
+// [24..29] raw Hi-Z probes
+// [30..35] minH hist (buckets: =0, <1e-4, <1e-3, <1e-2, <1e-1, >=1e-1)
 
 layout(push_constant) uniform PC {
     mat4 mvp[2];
@@ -94,8 +98,32 @@ float sampleHiZ(uint eye, vec2 uv, float lod) {
 
 float chooseHiZMip(vec2 rectSizePx) {
     float maxExtentHiZ = max(max(rectSizePx.x, rectSizePx.y) * 0.5, 1.0);
-    float maxMip = max(pc.prevDepthParams.w - 1.0, 0.0);
+    // LOD 4+ の SPD 出力が不完全なため LOD 3 にクランプ（暫定）
+    float maxMip = min(max(pc.prevDepthParams.w - 1.0, 0.0), 3.0);
     return clamp(max(ceil(log2(maxExtentHiZ)) - 1.0, 0.0), 0.0, maxMip);
+}
+
+void recordDeltaHistogram(float minDelta) {
+    uint bucket;
+    if      (minDelta < -0.1)    bucket = 0u;
+    else if (minDelta < -0.01)   bucket = 1u;
+    else if (minDelta < -0.001)  bucket = 2u;
+    else if (minDelta <  0.0)    bucket = 3u;
+    else if (minDelta <  0.001)  bucket = 4u;
+    else if (minDelta <  0.01)   bucket = 5u;
+    else if (minDelta <  0.1)    bucket = 6u;
+    else                         bucket = 7u;
+    atomicAdd(cullStats[3u + bucket], 1u);
+    atomicAdd(cullStats[11], 1u);
+}
+
+uint magBucket(float v) {
+    if (v <= 0.0)     return 0u;
+    if (v <  1e-4)    return 1u;
+    if (v <  1e-3)    return 2u;
+    if (v <  1e-2)    return 3u;
+    if (v <  1e-1)    return 4u;
+    return 5u;
 }
 
 bool aabbOccludedByPrevDepth(vec3 aMin, vec3 aMax) {
@@ -110,6 +138,8 @@ bool aabbOccludedByPrevDepth(vec3 aMin, vec3 aMax) {
     corners[7] = vec3(aMax.x, aMax.y, aMax.z);
 
     bool occludedBoth = true;
+    float worstDelta = 1e9;
+    bool anyEyeValid = false;
     for (uint eye = 0u; eye < 2u; ++eye) {
         vec2 minUv = vec2( 1e9);
         vec2 maxUv = vec2(-1e9);
@@ -129,6 +159,7 @@ bool aabbOccludedByPrevDepth(vec3 aMin, vec3 aMax) {
             occludedBoth = false;
             continue;
         }
+        anyEyeValid = true;
         vec2 rectMin = clamp(minUv, vec2(0.0), vec2(1.0));
         vec2 rectMax = clamp(maxUv, vec2(0.0), vec2(1.0));
         vec2 rectSizePx = max((rectMax - rectMin) * pc.prevDepthParams.xy, vec2(1.0));
@@ -138,19 +169,28 @@ bool aabbOccludedByPrevDepth(vec3 aMin, vec3 aMax) {
         vec2 texelMin = clamp(floor(rectMin * hiZSize) - vec2(1.0), vec2(0.0), hiZSize - 1.0);
         vec2 texelMax = clamp(ceil(rectMax * hiZSize) + vec2(1.0), vec2(0.0), hiZSize - 1.0);
         float depthLimit = max(nearestDepth + pc.prevDepthParams.z, 0.0);
-        bool occludedEye = true;
-        for (int ty = int(texelMin.y); ty <= int(texelMax.y) && occludedEye; ++ty) {
+        float minH = 1e9;
+        float maxH = 0.0;
+        for (int ty = int(texelMin.y); ty <= int(texelMax.y); ++ty) {
             for (int tx = int(texelMin.x); tx <= int(texelMax.x); ++tx) {
                 vec2 uv = (vec2(float(tx), float(ty)) + vec2(0.5)) / hiZSize;
-                float h = max(sampleHiZ(eye, uv, lod), 0.0);
-                if (h <= depthLimit) {
-                    occludedEye = false;
-                    break;
-                }
+                float hRaw = sampleHiZ(eye, uv, lod);
+                // SPD OOB 由来の無効値 (負値・>1) は近平面 1.0 (min reducer の中立) として扱う
+                float h = (hRaw > 0.0 && hRaw <= 1.0) ? hRaw : 1.0;
+                minH = min(minH, h);
+                maxH = max(maxH, h);
             }
         }
-        occludedBoth = occludedBoth && occludedEye;
+        float delta = minH - depthLimit;
+        worstDelta = min(worstDelta, delta);
+        if (delta <= 0.0) occludedBoth = false;
+        if (eye == 0u) {
+            atomicAdd(cullStats[12u + magBucket(maxH)], 1u);
+            atomicAdd(cullStats[18u + magBucket(depthLimit)], 1u);
+            atomicAdd(cullStats[30u + magBucket(minH)], 1u);
+        }
     }
+    if (anyEyeValid) recordDeltaHistogram(worstDelta);
     return occludedBoth;
 }
 
@@ -200,6 +240,21 @@ void main() {
         }
         if (s_vis) {
             atomicAdd(cullStats[2], 1u);
+        }
+        if (meshletId == 0u) {
+            // probe LOD 3 across screen + LOD 0,1,2 at center
+            float p0 = textureLod(hiZTex, vec3(0.5, 0.5, 0.0), 3.0).r;
+            float p1 = textureLod(hiZTex, vec3(0.0, 0.0, 0.0), 3.0).r;
+            float p2 = textureLod(hiZTex, vec3(1.0, 1.0, 0.0), 3.0).r;
+            float p3 = textureLod(hiZTex, vec3(0.5, 0.5, 0.0), 0.0).r;
+            float p4 = textureLod(hiZTex, vec3(0.5, 0.5, 0.0), 1.0).r;
+            float p5 = textureLod(hiZTex, vec3(0.5, 0.5, 0.0), 2.0).r;
+            cullStats[24] = floatBitsToUint(p0);
+            cullStats[25] = floatBitsToUint(p1);
+            cullStats[26] = floatBitsToUint(p2);
+            cullStats[27] = floatBitsToUint(p3);
+            cullStats[28] = floatBitsToUint(p4);
+            cullStats[29] = floatBitsToUint(p5);
         }
     }
     barrier();

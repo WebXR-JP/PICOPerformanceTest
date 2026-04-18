@@ -52,7 +52,10 @@ float ReduceQuad(float v) {
 }
 
 float LoadSrc(ivec2 p, uint eye) {
-    return texelFetch(srcDepth, ivec3(ClampSrc(p), int(eye)), 0).r;
+    // Reverse-Z: depth clear value = 0 (far plane) で未描画ピクセルが入る。
+    // min reducer で背景が伝播しないよう、未描画 (d==0) は 1.0 (near = 中立) として扱う。
+    float d = texelFetch(srcDepth, ivec3(ClampSrc(p), int(eye)), 0).r;
+    return d == 0.0 ? 1.0 : d;
 }
 
 float LoadMid(ivec2 p, uint eye) {
@@ -276,9 +279,9 @@ void main() {
     uint y = subXY.y + 8u * (gl_LocalInvocationIndex >> 7u);
     uvec2 workGroupID = gl_WorkGroupID.xy;
 
-    // 明示的にゼロ初期化（reverse-Z では 0 = far = 無効タイル相当）
+    // Reverse-Z + min reducer: 無効タイルの中立値は 1.0 (=near, min では吸収されない)
     for (uint i = gl_LocalInvocationIndex; i < 16u * 16u; i += 256u) {
-        spdIntermediate[i / 16u][i % 16u] = 0.0;
+        spdIntermediate[i / 16u][i % 16u] = 1.0;
     }
     barrier();
 

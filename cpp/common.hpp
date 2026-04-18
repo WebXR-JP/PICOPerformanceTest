@@ -122,6 +122,8 @@ struct VulkanCtx {
     vma::raii::Buffer                       cullStatsBuffer{nullptr};
     vma::raii::Buffer                       boneBuffer{nullptr};
     uint32_t                                totalBones = 0;
+    uint32_t                                vPerFace = 0;
+    uint32_t                                vPerCube = 0;
     std::vector<glm::vec3> bonePivots;
     vk::raii::DescriptorSetLayout           vsSkinDescLayout{nullptr};
     vk::raii::PipelineLayout                vsSkinPipelineLayout{nullptr};
@@ -218,6 +220,12 @@ struct App {
     uint32_t      lastFrustumMeshlets = 0;
     uint32_t      lastDepthRejectedMeshlets = 0;
     uint32_t      lastVisibleMeshlets = 0;
+    uint32_t      lastDeltaHist[8]    = {0};
+    uint32_t      lastDeltaHistTotal  = 0;
+    uint32_t      lastMinHHist[6]     = {0};
+    uint32_t      lastDepthLimitHist[6] = {0};
+    float         lastHiZProbe[6]     = {0};
+    uint32_t      lastMinHHist2[6]    = {0};
     double        lastCsMs         = 0.0;
     double        lastGfxMs        = 0.0;
     double        lastHiZMs        = 0.0;

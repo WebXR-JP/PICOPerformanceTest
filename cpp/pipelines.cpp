@@ -68,7 +68,7 @@ void CreateVsSkinPipeline(App& app, uint32_t width, uint32_t height) {
     CheckVkResult(vkCreateDescriptorSetLayout(Raw(app.vk.device), &dslCI, nullptr, &rawDescLayout));
     app.vk.vsSkinDescLayout = vk::raii::DescriptorSetLayout(app.vk.device, rawDescLayout);
 
-    VkPushConstantRange pcRange{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4) * 2 + sizeof(int32_t)};
+    VkPushConstantRange pcRange{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(glm::mat4) * 2 + sizeof(int32_t) * 3};
     VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plCI.setLayoutCount         = 1;
     VkDescriptorSetLayout vsSkinDescLayout = Raw(app.vk.vsSkinDescLayout);

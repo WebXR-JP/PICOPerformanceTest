@@ -69,7 +69,7 @@ void RenderStereo(App& app, uint32_t imageIdx,
         0,
     };
     vkCmdUpdateBuffer(cmd, Raw(app.vk.bfDrawCmdBuffer), 0, sizeof(drawCmdInit), drawCmdInit);
-    uint32_t cullStatsInit[4] = {0, 0, 0, 0};
+    uint32_t cullStatsInit[40] = {0};
     vkCmdUpdateBuffer(cmd, Raw(app.vk.cullStatsBuffer), 0, sizeof(cullStatsInit), cullStatsInit);
 
     VkMemoryBarrier2KHR fillToCs{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2_KHR};
@@ -267,11 +267,13 @@ void RenderStereo(App& app, uint32_t imageIdx,
 
     vkCmdBeginRenderingKHR(cmd, &ri);
 
-    struct GfxPushConst { glm::mat4 mvp[2]; int32_t aluIters; };
+    struct GfxPushConst { glm::mat4 mvp[2]; int32_t aluIters; int32_t vPerFace; int32_t vPerCube; };
     GfxPushConst pc;
     pc.mvp[0]   = mvp0;
     pc.mvp[1]   = mvp1;
     pc.aluIters = (int32_t)app.aluIters;
+    pc.vPerFace = (int32_t)app.vk.vPerFace;
+    pc.vPerCube = (int32_t)app.vk.vPerCube;
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Raw(app.vk.vsSkinPipeline));
     vkCmdPushConstants(cmd, Raw(app.vk.vsSkinPipelineLayout),
@@ -525,6 +527,16 @@ void RenderFrame(App& app) {
             app.lastFrustumMeshlets = stats[0];
             app.lastDepthRejectedMeshlets = stats[1];
             app.lastVisibleMeshlets = stats[2];
+            for (int i = 0; i < 8; i++) app.lastDeltaHist[i] = stats[3 + i];
+            app.lastDeltaHistTotal = stats[11];
+            for (int i = 0; i < 6; i++) app.lastMinHHist[i] = stats[12 + i];
+            for (int i = 0; i < 6; i++) app.lastDepthLimitHist[i] = stats[18 + i];
+            for (int i = 0; i < 6; i++) {
+                uint32_t u = stats[24 + i];
+                float f; std::memcpy(&f, &u, 4);
+                app.lastHiZProbe[i] = f;
+            }
+            for (int i = 0; i < 6; i++) app.lastMinHHist2[i] = stats[30 + i];
             app.vk.cullStatsBuffer.getAllocation().unmap();
         }
         CheckVkResult(vkResetFences(Raw(app.vk.device), 1, &fence));
@@ -568,6 +580,22 @@ void RenderFrame(App& app) {
              fps, avgMs, app.lastCsMs, app.lastGfxMs, app.lastDownsampleMs, app.lastHiZMs,
              polysTotal, liveTris, app.vk.meshletCount,
              app.lastFrustumMeshlets, app.lastDepthRejectedMeshlets, app.lastVisibleMeshlets);
+        LOGI("[HIST] minH-depthLimit (n=%u)  <-0.1:%u  -0.1~-.01:%u  -.01~-.001:%u  -.001~0:%u  | 0~.001:%u  .001~.01:%u  .01~.1:%u  >0.1:%u",
+             app.lastDeltaHistTotal,
+             app.lastDeltaHist[0], app.lastDeltaHist[1], app.lastDeltaHist[2], app.lastDeltaHist[3],
+             app.lastDeltaHist[4], app.lastDeltaHist[5], app.lastDeltaHist[6], app.lastDeltaHist[7]);
+        LOGI("[HIST] minH          =0:%u  <1e-4:%u  <1e-3:%u  <1e-2:%u  <1e-1:%u  >=1e-1:%u",
+             app.lastMinHHist2[0], app.lastMinHHist2[1], app.lastMinHHist2[2],
+             app.lastMinHHist2[3], app.lastMinHHist2[4], app.lastMinHHist2[5]);
+        LOGI("[HIST] maxH          =0:%u  <1e-4:%u  <1e-3:%u  <1e-2:%u  <1e-1:%u  >=1e-1:%u",
+             app.lastMinHHist[0], app.lastMinHHist[1], app.lastMinHHist[2],
+             app.lastMinHHist[3], app.lastMinHHist[4], app.lastMinHHist[5]);
+        LOGI("[HIST] depthLimit    =0:%u  <1e-4:%u  <1e-3:%u  <1e-2:%u  <1e-1:%u  >=1e-1:%u",
+             app.lastDepthLimitHist[0], app.lastDepthLimitHist[1], app.lastDepthLimitHist[2],
+             app.lastDepthLimitHist[3], app.lastDepthLimitHist[4], app.lastDepthLimitHist[5]);
+        LOGI("[PROBE] L3@(.5,.5) L3@(0,0) L3@(1,1) L0@(.5,.5) L1@(.5,.5) L2@(.5,.5) = %.6f %.6f %.6f %.6f %.6f %.6f",
+             app.lastHiZProbe[0], app.lastHiZProbe[1], app.lastHiZProbe[2],
+             app.lastHiZProbe[3], app.lastHiZProbe[4], app.lastHiZProbe[5]);
         app.frameMsAccum = 0.0;
         app.frameCount   = 0;
         app.lastLogTime  = t1;
