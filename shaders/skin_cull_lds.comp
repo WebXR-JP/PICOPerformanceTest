@@ -45,6 +45,7 @@ layout(std430, binding = 3) readonly  buffer SrcIdxBuf  { uint      srcIndices[]
 layout(std430, binding = 4) writeonly buffer DstIdxBuf  { uint      dstIndices[]; };
 layout(std430, binding = 5) coherent  buffer DrawCmdBuf { DrawCmd   cmd;          };
 layout(binding = 6) uniform sampler2DArray hiZTex;
+layout(std430, binding = 7) coherent buffer CullStatsBuf { uint cullStats[4]; };
 
 layout(push_constant) uniform PC {
     mat4 mvp[2];
@@ -186,8 +187,18 @@ void main() {
             s_vis = aabbInFrustum(m.aabbMin, m.aabbMax, pc.mvp[0])
                  || aabbInFrustum(m.aabbMin, m.aabbMax, pc.mvp[1]);
         }
+        if (s_vis) {
+            atomicAdd(cullStats[0], 1u);
+        }
         if (s_vis && pc.prevDepthEnabled != 0u) {
-            s_vis = !aabbOccludedByPrevDepth(m.aabbMin, m.aabbMax);
+            bool depthRejected = aabbOccludedByPrevDepth(m.aabbMin, m.aabbMax);
+            if (depthRejected) {
+                atomicAdd(cullStats[1], 1u);
+            }
+            s_vis = !depthRejected;
+        }
+        if (s_vis) {
+            atomicAdd(cullStats[2], 1u);
         }
     }
     barrier();

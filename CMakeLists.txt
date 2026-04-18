@@ -68,6 +68,8 @@ embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/skin_cull.comp"    skin_cull_s
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/skin_cull_lds.comp" skin_cull_lds_spv)
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/skin_cull_lds_u16.comp" skin_cull_lds_u16_spv)
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/hiz_spd.comp" hiz_spd_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/meshlet_aabb_debug.vert" meshlet_aabb_debug_vert_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/meshlet_aabb_debug.frag" meshlet_aabb_debug_frag_spv)
 
 # ---- android_native_app_glue（静的ライブラリ）----
 add_library(app_glue STATIC
@@ -91,6 +93,8 @@ add_library(PICOPerformanceTest MODULE
     "${SHADER_GEN_DIR}/skin_cull_lds_spv.h"
     "${SHADER_GEN_DIR}/skin_cull_lds_u16_spv.h"
     "${SHADER_GEN_DIR}/hiz_spd_spv.h"
+    "${SHADER_GEN_DIR}/meshlet_aabb_debug_vert_spv.h"
+    "${SHADER_GEN_DIR}/meshlet_aabb_debug_frag_spv.h"
 )
 
 target_include_directories(PICOPerformanceTest PRIVATE
