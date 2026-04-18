@@ -54,3 +54,38 @@ android {
 
 dependencies {
 }
+
+// ビルド後に compile_commands.json をプロジェクトルートへコピー（clangd 用）。
+// buildStagingDirectory 配下のハッシュ付きパスを動的に探索するため、
+// CMake 設定変更でハッシュが変わっても追従する。
+def projectRootDir = rootDir.parentFile.parentFile // E:/Repos/cpp/CG/PICOPerformanceTest
+def stagingDir = file('C:/PICO_bld/performancetest')
+
+tasks.register('copyCompileCommands') {
+    description 'Copy latest compile_commands.json from CMake build dir to project root for clangd.'
+    doLast {
+        if (!stagingDir.exists()) {
+            logger.warn("staging dir not found: ${stagingDir}")
+            return
+        }
+        def candidates = fileTree(stagingDir) {
+            include '**/compile_commands.json'
+            // tools/ 配下（CMake のツールチェーン試験用）は除外
+            exclude '**/tools/**'
+        }.files
+        if (candidates.isEmpty()) {
+            logger.warn("compile_commands.json not found under ${stagingDir}")
+            return
+        }
+        def latest = candidates.max { it.lastModified() }
+        def dest = new File(projectRootDir, 'compile_commands.json')
+        dest.bytes = latest.bytes
+        logger.lifecycle("copied ${latest} -> ${dest}")
+    }
+}
+
+afterEvaluate {
+    tasks.matching { it.name.startsWith('externalNativeBuild') }.configureEach {
+        finalizedBy tasks.named('copyCompileCommands')
+    }
+}

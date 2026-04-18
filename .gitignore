@@ -16,3 +16,7 @@ project/android/gradle/wrapper/gradle-wrapper.jar
 *.o
 *.a
 *.so
+
+# clangd (auto-copied by :copyCompileCommands)
+/compile_commands.json
+/.cache/
