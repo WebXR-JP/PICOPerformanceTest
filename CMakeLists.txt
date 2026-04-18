@@ -96,6 +96,9 @@ embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/hiz_naive_init.comp" hiz_naive
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/hiz_naive_step.comp" hiz_naive_step_spv)
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/meshlet_aabb_debug.vert" meshlet_aabb_debug_vert_spv)
 embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/meshlet_aabb_debug.frag" meshlet_aabb_debug_frag_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/motion_vector.vert" motion_vector_vert_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/motion_vector.frag" motion_vector_frag_spv)
+embed_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/depth_invert.frag" depth_invert_frag_spv)
 
 # ---- android_native_app_glue（静的ライブラリ）----
 add_library(app_glue STATIC
@@ -128,6 +131,9 @@ add_library(PICOPerformanceTest MODULE
     "${SHADER_GEN_DIR}/hiz_naive_step_spv.h"
     "${SHADER_GEN_DIR}/meshlet_aabb_debug_vert_spv.h"
     "${SHADER_GEN_DIR}/meshlet_aabb_debug_frag_spv.h"
+    "${SHADER_GEN_DIR}/motion_vector_vert_spv.h"
+    "${SHADER_GEN_DIR}/motion_vector_frag_spv.h"
+    "${SHADER_GEN_DIR}/depth_invert_frag_spv.h"
 )
 
 target_include_directories(PICOPerformanceTest PRIVATE

@@ -8,6 +8,9 @@
 #include "hiz_naive_step_spv.h"
 #include "meshlet_aabb_debug_frag_spv.h"
 #include "meshlet_aabb_debug_vert_spv.h"
+#include "motion_vector_frag_spv.h"
+#include "motion_vector_vert_spv.h"
+#include "depth_invert_frag_spv.h"
 #include "skin_cull_lds_spv.h"
 #include "vertex_vs_skin_spv.h"
 
@@ -364,6 +367,236 @@ void CreateHiZSpdPipeline(App& app) {
                       app.vk.hiZNaiveStepPipeline);
 }
 
+void CreateMVPipeline(App& app) {
+    EyeSwapchain& sc = app.xr.swapchains[0];
+
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo dslCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCI.bindingCount = 2;
+    dslCI.pBindings = bindings;
+    VkDescriptorSetLayout rawDescLayout = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateDescriptorSetLayout(Raw(app.vk.device), &dslCI, nullptr, &rawDescLayout));
+    app.vk.mvDescLayout = vk::raii::DescriptorSetLayout(app.vk.device, rawDescLayout);
+
+    VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayout mvDescLayout = Raw(app.vk.mvDescLayout);
+    plCI.setLayoutCount = 1;
+    plCI.pSetLayouts = &mvDescLayout;
+    VkPipelineLayout rawPipelineLayout = VK_NULL_HANDLE;
+    CheckVkResult(vkCreatePipelineLayout(Raw(app.vk.device), &plCI, nullptr, &rawPipelineLayout));
+    app.vk.mvPipelineLayout = vk::raii::PipelineLayout(app.vk.device, rawPipelineLayout);
+
+    auto makeShader = [&](const uint32_t* spv, uint32_t size) {
+        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        ci.codeSize = size;
+        ci.pCode = spv;
+        VkShaderModule rawShaderModule = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateShaderModule(Raw(app.vk.device), &ci, nullptr, &rawShaderModule));
+        return vk::raii::ShaderModule(app.vk.device, rawShaderModule);
+    };
+    vk::raii::ShaderModule vertMod = makeShader(motion_vector_vert_spv, motion_vector_vert_spv_size);
+    vk::raii::ShaderModule fragMod = makeShader(motion_vector_frag_spv, motion_vector_frag_spv_size);
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = Raw(vertMod);
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = Raw(fragMod);
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo viCI{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo iaCI{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    iaCI.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkViewport viewport{0.f, 0.f, (float)sc.mvWidth, (float)sc.mvHeight, 0.f, 1.f};
+    VkRect2D scissor{{0, 0}, {sc.mvWidth, sc.mvHeight}};
+    VkPipelineViewportStateCreateInfo vpCI{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vpCI.viewportCount = 1;
+    vpCI.pViewports = &viewport;
+    vpCI.scissorCount = 1;
+    vpCI.pScissors = &scissor;
+    VkPipelineRasterizationStateCreateInfo rsCI{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rsCI.polygonMode = VK_POLYGON_MODE_FILL;
+    rsCI.cullMode = VK_CULL_MODE_NONE;
+    rsCI.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rsCI.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo msCI{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    msCI.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo dsCI{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    dsCI.depthTestEnable = VK_FALSE;
+    dsCI.depthWriteEnable = VK_FALSE;
+    dsCI.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+    VkPipelineColorBlendAttachmentState cbAtt{};
+    cbAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cbCI{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cbCI.attachmentCount = 1;
+    cbCI.pAttachments = &cbAtt;
+
+    VkFormat mvColorFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkPipelineRenderingCreateInfoKHR dynRI{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+    dynRI.viewMask = 0b11u;
+    dynRI.colorAttachmentCount = 1;
+    dynRI.pColorAttachmentFormats = &mvColorFmt;
+    dynRI.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+
+    VkGraphicsPipelineCreateInfo gpCI{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpCI.pNext = &dynRI;
+    gpCI.stageCount = 2;
+    gpCI.pStages = stages;
+    gpCI.pVertexInputState = &viCI;
+    gpCI.pInputAssemblyState = &iaCI;
+    gpCI.pViewportState = &vpCI;
+    gpCI.pRasterizationState = &rsCI;
+    gpCI.pMultisampleState = &msCI;
+    gpCI.pDepthStencilState = &dsCI;
+    gpCI.pColorBlendState = &cbCI;
+    gpCI.layout = Raw(app.vk.mvPipelineLayout);
+    VkPipeline rawPipeline = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateGraphicsPipelines(
+        Raw(app.vk.device), VK_NULL_HANDLE, 1, &gpCI, nullptr, &rawPipeline));
+    app.vk.mvPipeline = vk::raii::Pipeline(app.vk.device, rawPipeline);
+
+    vk::BufferCreateInfo bi{};
+    bi.size = sizeof(MotionVectorUbo);
+    bi.usage = vk::BufferUsageFlagBits::eUniformBuffer;
+    bi.sharingMode = vk::SharingMode::eExclusive;
+    vma::AllocationCreateInfo aci{};
+    aci.usage = vma::MemoryUsage::eAutoPreferHost;
+    aci.flags = vma::AllocationCreateFlagBits::eMapped
+              | vma::AllocationCreateFlagBits::eHostAccessRandom;
+    app.vk.mvUboBuffer = vma::raii::Buffer(app.vk.allocator, bi, aci);
+
+    VkDescriptorPoolSize poolSizes[2]{};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[0].descriptorCount = 1;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSizes[1].descriptorCount = 1;
+    VkDescriptorPoolCreateInfo poolCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolCI.poolSizeCount = 2;
+    poolCI.pPoolSizes = poolSizes;
+    poolCI.maxSets = 1;
+    VkDescriptorPool rawDescPool = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateDescriptorPool(Raw(app.vk.device), &poolCI, nullptr, &rawDescPool));
+    app.vk.mvDescPool = vk::raii::DescriptorPool(app.vk.device, rawDescPool);
+
+    std::array<vk::DescriptorSetLayout, 1> setLayouts = {Raw(app.vk.mvDescLayout)};
+    app.vk.mvDescSets = app.vk.device.allocateDescriptorSets(
+        vk::DescriptorSetAllocateInfo(Raw(app.vk.mvDescPool),
+                                      static_cast<uint32_t>(setLayouts.size()),
+                                      setLayouts.data()));
+
+    VkDescriptorImageInfo depthInfo{};
+    depthInfo.sampler = Raw(app.vk.prevDepthSampler);
+    depthInfo.imageView = Raw(sc.depthSampleView);
+    depthInfo.imageLayout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL_KHR;
+    VkDescriptorBufferInfo uboInfo{};
+    uboInfo.buffer = Raw(app.vk.mvUboBuffer);
+    uboInfo.offset = 0;
+    uboInfo.range = sizeof(MotionVectorUbo);
+
+    VkWriteDescriptorSet writes[2]{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = Raw(app.vk.mvDescSets[0]);
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].pImageInfo = &depthInfo;
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = Raw(app.vk.mvDescSets[0]);
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[1].pBufferInfo = &uboInfo;
+    vkUpdateDescriptorSets(Raw(app.vk.device), 2, writes, 0, nullptr);
+
+    LOGI("Motion-vector pipeline created");
+}
+
+void CreateDepthInvertPipeline(App& app) {
+    EyeSwapchain& sc = app.xr.swapchains[0];
+
+    auto makeShader = [&](const uint32_t* spv, uint32_t size) {
+        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        ci.codeSize = size;
+        ci.pCode = spv;
+        VkShaderModule raw = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateShaderModule(Raw(app.vk.device), &ci, nullptr, &raw));
+        return vk::raii::ShaderModule(app.vk.device, raw);
+    };
+    vk::raii::ShaderModule vertMod = makeShader(motion_vector_vert_spv, motion_vector_vert_spv_size);
+    vk::raii::ShaderModule fragMod = makeShader(depth_invert_frag_spv, depth_invert_frag_spv_size);
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = Raw(vertMod);
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = Raw(fragMod);
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo viCI{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo iaCI{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    iaCI.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkViewport viewport{0.f, 0.f, (float)sc.width, (float)sc.height, 0.f, 1.f};
+    VkRect2D scissor{{0, 0}, {sc.width, sc.height}};
+    VkPipelineViewportStateCreateInfo vpCI{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vpCI.viewportCount = 1;
+    vpCI.pViewports = &viewport;
+    vpCI.scissorCount = 1;
+    vpCI.pScissors = &scissor;
+    VkPipelineRasterizationStateCreateInfo rsCI{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rsCI.polygonMode = VK_POLYGON_MODE_FILL;
+    rsCI.cullMode = VK_CULL_MODE_NONE;
+    rsCI.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rsCI.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo msCI{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    msCI.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo dsCI{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    dsCI.depthTestEnable = VK_FALSE;
+    dsCI.depthWriteEnable = VK_TRUE;
+    dsCI.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+    VkPipelineColorBlendStateCreateInfo cbCI{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cbCI.attachmentCount = 0;
+
+    VkPipelineRenderingCreateInfoKHR dynRI{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+    dynRI.viewMask = 0b11u;
+    dynRI.colorAttachmentCount = 0;
+    dynRI.depthAttachmentFormat = sc.aswDepthFormat;
+
+    VkGraphicsPipelineCreateInfo gpCI{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpCI.pNext = &dynRI;
+    gpCI.stageCount = 2;
+    gpCI.pStages = stages;
+    gpCI.pVertexInputState = &viCI;
+    gpCI.pInputAssemblyState = &iaCI;
+    gpCI.pViewportState = &vpCI;
+    gpCI.pRasterizationState = &rsCI;
+    gpCI.pMultisampleState = &msCI;
+    gpCI.pDepthStencilState = &dsCI;
+    gpCI.pColorBlendState = &cbCI;
+    gpCI.layout = Raw(app.vk.mvPipelineLayout);
+    VkPipeline raw = VK_NULL_HANDLE;
+    CheckVkResult(vkCreateGraphicsPipelines(
+        Raw(app.vk.device), VK_NULL_HANDLE, 1, &gpCI, nullptr, &raw));
+    app.vk.depthInvertPipeline = vk::raii::Pipeline(app.vk.device, raw);
+
+    LOGI("Depth-invert pipeline created");
+}
+
 void CreateMeshletDebugPipeline(App& app, uint32_t width, uint32_t height) {
     VkDescriptorSetLayoutBinding bindings[3]{};
     bindings[0].binding = 0;
@@ -494,7 +727,9 @@ void CreateFrameResources(App& app, VkFormat colorFormat) {
 
     CreateImage(app.vk, sc.width, sc.height,
                 VK_FORMAT_D32_SFLOAT,
-                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                 sc.depthImage,
                 2);
 
@@ -567,6 +802,30 @@ void CreateFrameResources(App& app, VkFormat colorFormat) {
         VkImageView rawSwapchainView = VK_NULL_HANDLE;
         CheckVkResult(vkCreateImageView(Raw(app.vk.device), &civCI, nullptr, &rawSwapchainView));
         si.view = vk::raii::ImageView(app.vk.device, rawSwapchainView);
+    }
+
+    for (uint32_t i = 0; i < sc.mvImages.size(); ++i) {
+        SwapchainImage& si = sc.mvImages[i];
+        VkImageViewCreateInfo ivCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        ivCI.image = si.image;
+        ivCI.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        ivCI.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ivCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+        VkImageView rawImageView = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateImageView(Raw(app.vk.device), &ivCI, nullptr, &rawImageView));
+        si.view = vk::raii::ImageView(app.vk.device, rawImageView);
+    }
+
+    for (uint32_t i = 0; i < sc.aswDepthImages.size(); ++i) {
+        SwapchainImage& si = sc.aswDepthImages[i];
+        VkImageViewCreateInfo ivCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        ivCI.image = si.image;
+        ivCI.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        ivCI.format = sc.aswDepthFormat;
+        ivCI.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
+        VkImageView rawImageView = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateImageView(Raw(app.vk.device), &ivCI, nullptr, &rawImageView));
+        si.view = vk::raii::ImageView(app.vk.device, rawImageView);
     }
 
     VkCommandBufferAllocateInfo cbAI{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};

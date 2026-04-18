@@ -53,6 +53,8 @@ void Initialize(App& app) {
     CreateVsSkinPipeline(app, w, h);
     CreateSkinCullLdsPipeline(app);
     CreateHiZSpdPipeline(app);
+    CreateMVPipeline(app);
+    CreateDepthInvertPipeline(app);
     CreateMeshletDebugPipeline(app, w, h);
     CreateQueryPool(app);
 
@@ -119,6 +121,12 @@ void Cleanup(App& app) {
         app.vk.cmdBuffers.clear();
         app.vk.fence = nullptr;
 
+        app.vk.mvDescSets.clear();
+        app.vk.mvDescPool = nullptr;
+        app.vk.mvUboBuffer = nullptr;
+        app.vk.mvPipeline = nullptr;
+        app.vk.mvPipelineLayout = nullptr;
+        app.vk.mvDescLayout = nullptr;
         app.vk.meshletDebugPipeline = nullptr;
         app.vk.meshletDebugPipelineLayout = nullptr;
         app.vk.meshletDebugDescLayout = nullptr;
@@ -154,6 +162,12 @@ void Cleanup(App& app) {
             for (auto& si : sc.images) {
                 si.view = nullptr;
             }
+            for (auto& si : sc.mvImages) {
+                si.view = nullptr;
+            }
+            for (auto& si : sc.aswDepthImages) {
+                si.view = nullptr;
+            }
             for (uint32_t ping = 0; ping < 2; ++ping) {
                 sc.hiZMipViews[ping].clear();
                 sc.hiZViews[ping] = nullptr;
@@ -179,6 +193,8 @@ void Cleanup(App& app) {
     if (app.xr.appSpace) xrDestroySpace(app.xr.appSpace);
     for (auto& sc : app.xr.swapchains) {
         if (sc.handle) xrDestroySwapchain(sc.handle);
+        if (sc.mvSwapchain) xrDestroySwapchain(sc.mvSwapchain);
+        if (sc.aswDepthSwapchain) xrDestroySwapchain(sc.aswDepthSwapchain);
     }
     if (app.xr.session)  xrDestroySession(app.xr.session);
     if (app.xr.instance) xrDestroyInstance(app.xr.instance);

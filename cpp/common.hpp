@@ -82,6 +82,13 @@ struct EyeSwapchain {
     uint32_t    width  = 0;
     uint32_t    height = 0;
     std::vector<SwapchainImage> images;
+    XrSwapchain                      mvSwapchain = XR_NULL_HANDLE;
+    uint32_t                         mvWidth     = 0;
+    uint32_t                         mvHeight    = 0;
+    std::vector<SwapchainImage>      mvImages;
+    XrSwapchain                      aswDepthSwapchain = XR_NULL_HANDLE;
+    VkFormat                         aswDepthFormat    = VK_FORMAT_UNDEFINED;
+    std::vector<SwapchainImage>      aswDepthImages;
     vma::raii::Image                     depthImage{nullptr};
     vk::raii::ImageView                  depthView{nullptr};
     vk::raii::ImageView                  depthSampleView{nullptr};
@@ -147,6 +154,13 @@ struct VulkanCtx {
     vk::raii::DescriptorSetLayout           meshletDebugDescLayout{nullptr};
     vk::raii::PipelineLayout                meshletDebugPipelineLayout{nullptr};
     vk::raii::Pipeline                      meshletDebugPipeline{nullptr};
+    vk::raii::DescriptorSetLayout           mvDescLayout{nullptr};
+    vk::raii::PipelineLayout                mvPipelineLayout{nullptr};
+    vk::raii::Pipeline                      mvPipeline{nullptr};
+    vma::raii::Buffer                       mvUboBuffer{nullptr};
+    vk::raii::DescriptorPool                mvDescPool{nullptr};
+    vk::raii::DescriptorSets                mvDescSets{nullptr};
+    vk::raii::Pipeline                      depthInvertPipeline{nullptr};
 };
 
 inline constexpr uint32_t TS_CS_BEGIN      = 0;
@@ -212,6 +226,13 @@ struct Meshlet {
 };
 static_assert(sizeof(Meshlet) == 64, "Meshlet struct must be 64 bytes (std430)");
 
+struct MotionVectorUbo {
+    glm::mat4 invCurMvp[2];
+    glm::mat4 prevMvp[2];
+};
+static_assert(sizeof(MotionVectorUbo) == sizeof(glm::mat4) * 4,
+              "MotionVectorUbo must be 256 bytes");
+
 inline constexpr int MESHLET_TILE = 16;
 
 struct App {
@@ -246,7 +267,7 @@ struct App {
     float         playerYaw        = 0.f;
     glm::mat4     prevMvpForHiZ[2] = {glm::mat4(1.f), glm::mat4(1.f)};  // 前フレーム Hi-Z 生成時の MVP (再投影用)
     XrTime        lastFrameTime    = 0;
-    bool          debugAabbEnabled = true;
+    bool          debugAabbEnabled = false;
 
     using Clock = std::chrono::high_resolution_clock;
     Clock::time_point lastLogTime;

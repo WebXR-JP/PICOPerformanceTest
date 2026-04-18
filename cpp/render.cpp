@@ -35,7 +35,7 @@ glm::mat4 ComputeMVP(const XrView& view, const glm::mat4& model,
     return proj * view_mat * model;
 }
 
-void RenderStereo(App& app, uint32_t imageIdx,
+void RenderStereo(App& app, uint32_t imageIdx, uint32_t mvImageIdx, uint32_t aswDepthImageIdx,
                   const std::vector<XrView>& views,
                   uint32_t swapW, uint32_t swapH) {
     const uint32_t prevDepthReadIdx  = app.frameParity & 1u;
@@ -362,22 +362,65 @@ void RenderStereo(App& app, uint32_t imageIdx,
                                Raw(app.vk.queryPool), TS_GFX_END);
     }
 
-    VkImageMemoryBarrier2KHR depthToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
-    depthToRead.srcStageMask        = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT_KHR;
-    depthToRead.srcAccessMask       = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT_KHR;
-    depthToRead.dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
-    depthToRead.dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT_KHR;
-    depthToRead.oldLayout           = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
-    depthToRead.newLayout           = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL_KHR;
-    depthToRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    depthToRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    depthToRead.image               = Raw(sc.depthImage);
-    depthToRead.subresourceRange    = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
+    // Transition source depth for sampling (both depth-invert pass and Hi-Z).
+    // aswDepth image goes to DEPTH_ATTACHMENT_OPTIMAL for the depth-invert pass.
     {
+        VkImageMemoryBarrier2KHR prep[2]{};
+        prep[0].sType                = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR;
+        prep[0].srcStageMask         = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT_KHR;
+        prep[0].srcAccessMask        = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT_KHR;
+        prep[0].dstStageMask         = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT_KHR
+                                     | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        prep[0].dstAccessMask        = VK_ACCESS_2_SHADER_READ_BIT_KHR;
+        prep[0].oldLayout            = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
+        prep[0].newLayout            = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL_KHR;
+        prep[0].srcQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED;
+        prep[0].dstQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED;
+        prep[0].image                = Raw(sc.depthImage);
+        prep[0].subresourceRange     = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
+
+        prep[1].sType                = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR;
+        prep[1].srcStageMask         = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR;
+        prep[1].dstStageMask         = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT_KHR
+                                     | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT_KHR;
+        prep[1].dstAccessMask        = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT_KHR
+                                     | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT_KHR;
+        prep[1].oldLayout            = VK_IMAGE_LAYOUT_UNDEFINED;
+        prep[1].newLayout            = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
+        prep[1].srcQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED;
+        prep[1].dstQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED;
+        prep[1].image                = sc.aswDepthImages[aswDepthImageIdx].image;
+        prep[1].subresourceRange     = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 2};
+
         VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
-        dep.imageMemoryBarrierCount = 1;
-        dep.pImageMemoryBarriers    = &depthToRead;
+        dep.imageMemoryBarrierCount = 2;
+        dep.pImageMemoryBarriers    = prep;
         vkCmdPipelineBarrier2KHR(cmd, &dep);
+    }
+
+    // Depth-invert pass: reverse-Z → standard-Z into aswDepth swapchain.
+    if (IsValid(app.vk.depthInvertPipeline)) {
+        VkRenderingAttachmentInfoKHR depthAtt{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+        depthAtt.imageView   = Raw(sc.aswDepthImages[aswDepthImageIdx].view);
+        depthAtt.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
+        depthAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depthAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+        VkRenderingInfoKHR ri{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+        ri.renderArea.offset = {0, 0};
+        ri.renderArea.extent = {sc.width, sc.height};
+        ri.layerCount        = 1;
+        ri.viewMask          = 0b11u;
+        ri.colorAttachmentCount = 0;
+        ri.pDepthAttachment  = &depthAtt;
+
+        vkCmdBeginRenderingKHR(cmd, &ri);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Raw(app.vk.depthInvertPipeline));
+        VkDescriptorSet diSet = Raw(app.vk.mvDescSets[0]);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                Raw(app.vk.mvPipelineLayout), 0, 1, &diSet, 0, nullptr);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdEndRenderingKHR(cmd);
     }
 
     struct HiZSpdPC {
@@ -503,6 +546,80 @@ void RenderStereo(App& app, uint32_t imageIdx,
                                Raw(app.vk.queryPool), TS_HIZ_END);
     }
 
+    {
+        VkImageMemoryBarrier2KHR barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR;
+        barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = sc.mvImages[mvImageIdx].image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+
+        VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2KHR(cmd, &dep);
+    }
+
+    MotionVectorUbo mvUbo{};
+    mvUbo.invCurMvp[0] = glm::inverse(mvp0);
+    mvUbo.invCurMvp[1] = glm::inverse(mvp1);
+    mvUbo.prevMvp[0] = app.prevMvpForHiZ[0];
+    mvUbo.prevMvp[1] = app.prevMvpForHiZ[1];
+    {
+        void* p = app.vk.mvUboBuffer.getAllocation().map();
+        std::memcpy(p, &mvUbo, sizeof(mvUbo));
+        app.vk.mvUboBuffer.getAllocation().unmap();
+    }
+
+    VkRenderingAttachmentInfoKHR mvColorAtt{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+    mvColorAtt.imageView = Raw(sc.mvImages[mvImageIdx].view);
+    mvColorAtt.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
+    mvColorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    mvColorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    mvColorAtt.clearValue.color.float32[0] = 0.0f;
+    mvColorAtt.clearValue.color.float32[1] = 0.0f;
+    mvColorAtt.clearValue.color.float32[2] = 0.0f;
+    mvColorAtt.clearValue.color.float32[3] = 0.0f;
+
+    VkRenderingInfoKHR mvRi{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+    mvRi.renderArea.offset = {0, 0};
+    mvRi.renderArea.extent = {sc.mvWidth, sc.mvHeight};
+    mvRi.layerCount = 1;
+    mvRi.viewMask = 0b11u;
+    mvRi.colorAttachmentCount = 1;
+    mvRi.pColorAttachments = &mvColorAtt;
+
+    vkCmdBeginRenderingKHR(cmd, &mvRi);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Raw(app.vk.mvPipeline));
+    VkDescriptorSet mvDescSet = Raw(app.vk.mvDescSets[0]);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            Raw(app.vk.mvPipelineLayout), 0, 1, &mvDescSet, 0, nullptr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRenderingKHR(cmd);
+
+    {
+        VkImageMemoryBarrier2KHR mvToGeneral{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
+        mvToGeneral.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR;
+        mvToGeneral.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR;
+        mvToGeneral.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR;
+        mvToGeneral.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT_KHR;
+        mvToGeneral.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
+        mvToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        mvToGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        mvToGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        mvToGeneral.image = sc.mvImages[mvImageIdx].image;
+        mvToGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+
+        VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &mvToGeneral;
+        vkCmdPipelineBarrier2KHR(cmd, &dep);
+    }
+
     CheckVkResult(vkEndCommandBuffer(cmd));
 
     // 次フレームの reprojection 用に、今フレームの MVP (この frame の Hi-Z 生成根拠) を保存
@@ -524,6 +641,7 @@ void RenderFrame(App& app) {
     std::vector<XrCompositionLayerBaseHeader*> layers;
     XrCompositionLayerProjection projLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     std::vector<XrCompositionLayerProjectionView> projViews;
+    std::vector<XrCompositionLayerSpaceWarpInfoFB> swInfos;
 
     if (fst.shouldRender) {
         uint32_t viewCount = 2;
@@ -549,12 +667,21 @@ void RenderFrame(App& app) {
         waitInfo.timeout = XR_INFINITE_DURATION;
         CHECK_XR(xrWaitSwapchainImage(sc.handle, &waitInfo));
 
+        uint32_t mvImgIdx = 0;
+        CHECK_XR(xrAcquireSwapchainImage(sc.mvSwapchain, &acqInfo, &mvImgIdx));
+        CHECK_XR(xrWaitSwapchainImage(sc.mvSwapchain, &waitInfo));
+
+        uint32_t aswDepthImgIdx = 0;
+        CHECK_XR(xrAcquireSwapchainImage(sc.aswDepthSwapchain, &acqInfo, &aswDepthImgIdx));
+        CHECK_XR(xrWaitSwapchainImage(sc.aswDepthSwapchain, &waitInfo));
+
         std::vector<XrView> renderViewsVec(viewCount, {XR_TYPE_VIEW});
         for (uint32_t eye = 0; eye < viewCount; ++eye) {
             renderViewsVec[eye] = renderViews[eye];
         }
-        RenderStereo(app, imgIdx, renderViewsVec, sc.width, sc.height);
+        RenderStereo(app, imgIdx, mvImgIdx, aswDepthImgIdx, renderViewsVec, sc.width, sc.height);
 
+        swInfos.resize(viewCount);
         for (uint32_t eye = 0; eye < viewCount; eye++) {
             projViews[eye] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
             projViews[eye].pose = renderViews[eye].pose;
@@ -563,6 +690,26 @@ void RenderFrame(App& app) {
             projViews[eye].subImage.imageRect.offset      = {0, 0};
             projViews[eye].subImage.imageRect.extent      = {(int32_t)sc.width, (int32_t)sc.height};
             projViews[eye].subImage.imageArrayIndex       = eye;
+
+            XrCompositionLayerSpaceWarpInfoFB& sw = swInfos[eye];
+            sw = {XR_TYPE_COMPOSITION_LAYER_SPACE_WARP_INFO_FB};
+            sw.layerFlags = 0;
+            sw.motionVectorSubImage.swapchain = sc.mvSwapchain;
+            sw.motionVectorSubImage.imageRect.offset = {0, 0};
+            sw.motionVectorSubImage.imageRect.extent = {(int32_t)sc.mvWidth, (int32_t)sc.mvHeight};
+            sw.motionVectorSubImage.imageArrayIndex = eye;
+            sw.depthSubImage.swapchain = sc.aswDepthSwapchain;
+            sw.depthSubImage.imageRect.offset = {0, 0};
+            sw.depthSubImage.imageRect.extent = {(int32_t)sc.width, (int32_t)sc.height};
+            sw.depthSubImage.imageArrayIndex = eye;
+            sw.minDepth = 0.0f;
+            sw.maxDepth = 1.0f;
+            // Reverse-Z: swap nearZ/farZ to signal the runtime.
+            sw.nearZ = 100.0f;
+            sw.farZ  = 0.05f;
+            sw.appSpaceDeltaPose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+            sw.appSpaceDeltaPose.position = {0.0f, 0.0f, 0.0f};
+            projViews[eye].next = &sw;
         }
 
         VkFence fence = Raw(app.vk.fence);
@@ -625,6 +772,8 @@ void RenderFrame(App& app) {
 
         XrSwapchainImageReleaseInfo relInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         CHECK_XR(xrReleaseSwapchainImage(sc.handle, &relInfo));
+        CHECK_XR(xrReleaseSwapchainImage(sc.mvSwapchain, &relInfo));
+        CHECK_XR(xrReleaseSwapchainImage(sc.aswDepthSwapchain, &relInfo));
 
         projLayer.space                = app.xr.appSpace;
         projLayer.viewCount            = viewCount;

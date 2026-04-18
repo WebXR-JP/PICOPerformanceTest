@@ -27,6 +27,7 @@ void CreateXrInstance(App& app) {
     const char* extensions[] = {
         "XR_KHR_android_create_instance",
         "XR_KHR_vulkan_enable2",
+        "XR_FB_space_warp",
         "XR_BD_controller_interaction",
     };
 
@@ -240,6 +241,11 @@ void CreateSwapchains(App& app) {
     std::vector<int64_t> fmts(fmtCount);
     CHECK_XR(xrEnumerateSwapchainFormats(app.xr.session, fmtCount, &fmtCount, fmts.data()));
 
+    XrSystemSpaceWarpPropertiesFB swProps{XR_TYPE_SYSTEM_SPACE_WARP_PROPERTIES_FB};
+    XrSystemProperties sysProps{XR_TYPE_SYSTEM_PROPERTIES};
+    sysProps.next = &swProps;
+    CHECK_XR(xrGetSystemProperties(app.xr.instance, app.xr.systemId, &sysProps));
+
     int64_t colorFmt = (int64_t)VK_FORMAT_R8G8B8A8_SRGB;
     bool found = false;
     for (int64_t f : fmts) {
@@ -251,10 +257,63 @@ void CreateSwapchains(App& app) {
     }
     LOGI("Swapchain color format: %lld", (long long)colorFmt);
 
+    auto hasFormat = [&](int64_t fmt) {
+        return std::find(fmts.begin(), fmts.end(), fmt) != fmts.end();
+    };
+
+    const int64_t mvFmt = (int64_t)VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (!hasFormat(mvFmt)) {
+        LOGE("VK_FORMAT_R16G16B16A16_SFLOAT is required for SpaceWarp motion vectors");
+        assert(false);
+    }
+
+    const VkFormat depthCandidates[] = {
+        VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_D24_UNORM_S8_UINT,
+        VK_FORMAT_D16_UNORM,
+    };
+    VkFormat aswDepthFormat = VK_FORMAT_UNDEFINED;
+    for (VkFormat candidate : depthCandidates) {
+        if (hasFormat((int64_t)candidate)) {
+            aswDepthFormat = candidate;
+            break;
+        }
+    }
+    if (aswDepthFormat == VK_FORMAT_UNDEFINED) {
+        LOGE("No supported depth swapchain format found for SpaceWarp");
+        assert(false);
+    }
+    LOGI("SpaceWarp mvRect=%ux%u depthFormat=%d",
+         swProps.recommendedMotionVectorImageRectWidth,
+         swProps.recommendedMotionVectorImageRectHeight,
+         (int)aswDepthFormat);
+
     app.xr.swapchains.resize(1);
     EyeSwapchain& sc = app.xr.swapchains[0];
     sc.width  = (uint32_t)(vcViews[0].recommendedImageRectWidth  * app.resScale);
     sc.height = (uint32_t)(vcViews[0].recommendedImageRectHeight * app.resScale);
+    sc.mvWidth = swProps.recommendedMotionVectorImageRectWidth;
+    sc.mvHeight = swProps.recommendedMotionVectorImageRectHeight;
+    if (sc.mvWidth == 0 || sc.mvHeight == 0) {
+        LOGW("SpaceWarp recommended motion-vector extent was zero, falling back to color extent");
+        sc.mvWidth = sc.width;
+        sc.mvHeight = sc.height;
+    }
+    sc.aswDepthFormat = aswDepthFormat;
+
+    auto enumerateSwapchainImages = [&](XrSwapchain handle, std::vector<SwapchainImage>& images) {
+        uint32_t imgCount = 0;
+        CHECK_XR(xrEnumerateSwapchainImages(handle, 0, &imgCount, nullptr));
+        std::vector<XrSwapchainImageVulkanKHR> xrImages(imgCount,
+            {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        CHECK_XR(xrEnumerateSwapchainImages(handle, imgCount, &imgCount,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(xrImages.data())));
+
+        images.resize(imgCount);
+        for (uint32_t i = 0; i < imgCount; ++i) {
+            images[i].image = xrImages[i].image;
+        }
+    };
 
     XrSwapchainCreateInfo sci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
@@ -267,19 +326,40 @@ void CreateSwapchains(App& app) {
     sci.arraySize   = 2;
     sci.mipCount    = 1;
     CHECK_XR(xrCreateSwapchain(app.xr.session, &sci, &sc.handle));
+    enumerateSwapchainImages(sc.handle, sc.images);
+    LOGI("Stereo swapchain: %ux%u arraySize=2, %u images",
+         sc.width, sc.height, (uint32_t)sc.images.size());
 
-    uint32_t imgCount = 0;
-    CHECK_XR(xrEnumerateSwapchainImages(sc.handle, 0, &imgCount, nullptr));
-    std::vector<XrSwapchainImageVulkanKHR> xrImages(imgCount,
-        {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
-    CHECK_XR(xrEnumerateSwapchainImages(sc.handle, imgCount, &imgCount,
-        (XrSwapchainImageBaseHeader*)xrImages.data()));
+    XrSwapchainCreateInfo mvSci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    mvSci.usageFlags  = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                        XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    mvSci.format      = mvFmt;
+    mvSci.sampleCount = 1;
+    mvSci.width       = sc.mvWidth;
+    mvSci.height      = sc.mvHeight;
+    mvSci.faceCount   = 1;
+    mvSci.arraySize   = 2;
+    mvSci.mipCount    = 1;
+    CHECK_XR(xrCreateSwapchain(app.xr.session, &mvSci, &sc.mvSwapchain));
+    enumerateSwapchainImages(sc.mvSwapchain, sc.mvImages);
+    LOGI("SpaceWarp MV swapchain: %ux%u arraySize=2, %u images",
+         sc.mvWidth, sc.mvHeight, (uint32_t)sc.mvImages.size());
 
-    sc.images.resize(imgCount);
-    for (uint32_t i = 0; i < imgCount; i++) {
-        sc.images[i].image = xrImages[i].image;
-    }
-    LOGI("Stereo swapchain: %dx%d arraySize=2, %d images", sc.width, sc.height, imgCount);
+    XrSwapchainCreateInfo depthSci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    depthSci.usageFlags  = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                           XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                           XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    depthSci.format      = (int64_t)sc.aswDepthFormat;
+    depthSci.sampleCount = 1;
+    depthSci.width       = sc.width;
+    depthSci.height      = sc.height;
+    depthSci.faceCount   = 1;
+    depthSci.arraySize   = 2;
+    depthSci.mipCount    = 1;
+    CHECK_XR(xrCreateSwapchain(app.xr.session, &depthSci, &sc.aswDepthSwapchain));
+    enumerateSwapchainImages(sc.aswDepthSwapchain, sc.aswDepthImages);
+    LOGI("SpaceWarp depth swapchain: %ux%u arraySize=2, %u images",
+         sc.width, sc.height, (uint32_t)sc.aswDepthImages.size());
 }
 
 void CreateXrInput(App& app) {
