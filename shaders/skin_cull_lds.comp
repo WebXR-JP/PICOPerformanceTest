@@ -171,17 +171,20 @@ bool aabbOccludedByPrevDepth(vec3 aMin, vec3 aMax) {
         float depthLimit = max(nearestDepth + pc.prevDepthParams.z, 0.0);
         float minH = 1e9;
         float maxH = 0.0;
+        bool hasRendered = false;  // 少なくとも 1 サンプルが実レンダ値 (< 1.0) か
         for (int ty = int(texelMin.y); ty <= int(texelMax.y); ++ty) {
             for (int tx = int(texelMin.x); tx <= int(texelMax.x); ++tx) {
                 vec2 uv = (vec2(float(tx), float(ty)) + vec2(0.5)) / hiZSize;
                 float hRaw = sampleHiZ(eye, uv, lod);
-                // SPD OOB 由来の無効値は近平面 1.0 (min reducer の中立) として扱う。
-                // 閾値 1e-4 未満はこのシーンの Z 範囲外 (>10km) なので garbage 扱い。
-                float h = (hRaw >= 1e-4 && hRaw <= 1.0) ? hRaw : 1.0;
+                bool valid = (hRaw >= 1e-4 && hRaw < 1.0);
+                float h = valid ? hRaw : 1.0;
+                if (valid) hasRendered = true;
                 minH = min(minH, h);
                 maxH = max(maxH, h);
             }
         }
+        // 実レンダ値がゼロ件 = Hi-Z 上で「何も描画されていない領域」= 遮蔽判定不可
+        if (!hasRendered) { occludedBoth = false; continue; }
         float delta = minH - depthLimit;
         worstDelta = min(worstDelta, delta);
         if (delta <= 0.0) occludedBoth = false;
@@ -231,6 +234,16 @@ void main() {
         }
         if (s_vis) {
             atomicAdd(cullStats[0], 1u);
+        }
+        // Meshlet 単位の backface cull（両目とも裏向きなら捨てる）
+        if (s_vis && pc.cullEnabled != 0u) {
+            vec3 cc = 0.5 * (m.aabbMin + m.aabbMax);
+            bool backL = dot(cc - pc.camPos[0].xyz, m.normal) > 0.0;
+            bool backR = dot(cc - pc.camPos[1].xyz, m.normal) > 0.0;
+            if (backL && backR) {
+                s_vis = false;
+                atomicAdd(cullStats[36], 1u);
+            }
         }
         if (s_vis && pc.prevDepthEnabled != 0u) {
             bool depthRejected = aabbOccludedByPrevDepth(m.aabbMin, m.aabbMax);

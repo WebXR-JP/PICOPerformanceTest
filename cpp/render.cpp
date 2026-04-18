@@ -142,7 +142,7 @@ void RenderStereo(App& app, uint32_t imageIdx,
     lpc.camPos[0]    = cam_world(views[0]);
     lpc.camPos[1]    = cam_world(views[1]);
     lpc.meshletCount = app.vk.meshletCount;
-    lpc.cullEnabled  = 0u;  // 一時的に triangle backface cull 無効
+    lpc.cullEnabled  = 1u;  // meshlet + triangle backface cull
     lpc.frustumEnabled = (uint32_t)app.mode7Frustum;
     lpc.prevDepthEnabled = app.prevDepthValid ? 1u : 0u;
     lpc.prevDepthParams = glm::vec4((float)swapW, (float)swapH, 0.0003f,
@@ -585,6 +585,7 @@ void RenderFrame(App& app) {
                 app.lastHiZProbe[i] = f;
             }
             for (int i = 0; i < 6; i++) app.lastMinHHist2[i] = stats[30 + i];
+            app.lastBackfaceRejectedMeshlets = stats[36];
             app.vk.cullStatsBuffer.getAllocation().unmap();
         }
         CheckVkResult(vkResetFences(Raw(app.vk.device), 1, &fence));
@@ -624,10 +625,11 @@ void RenderFrame(App& app) {
         double fps      = app.frameCount / elapsed;
         int    polysTotal = (int)app.vk.meshletCount * MESHLET_TILE * MESHLET_TILE * 2 * app.instCount;
         uint32_t liveTris = app.lastBfIndexCount / 3;
-        LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  DS=%.3fms  HiZ=%.3fms  Polys=%d  LiveTris=%u  Meshlets=%u  FrustumM=%u  DepthRejectM=%u  VisibleM=%u",
+        LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  DS=%.3fms  HiZ=%.3fms  Polys=%d  LiveTris=%u  Meshlets=%u  FrustumM=%u  BackfaceM=%u  DepthRejectM=%u  VisibleM=%u",
              fps, avgMs, app.lastCsMs, app.lastGfxMs, app.lastDownsampleMs, app.lastHiZMs,
              polysTotal, liveTris, app.vk.meshletCount,
-             app.lastFrustumMeshlets, app.lastDepthRejectedMeshlets, app.lastVisibleMeshlets);
+             app.lastFrustumMeshlets, app.lastBackfaceRejectedMeshlets,
+             app.lastDepthRejectedMeshlets, app.lastVisibleMeshlets);
         LOGI("[HIST] minH-depthLimit (n=%u)  <-0.1:%u  -0.1~-.01:%u  -.01~-.001:%u  -.001~0:%u  | 0~.001:%u  .001~.01:%u  .01~.1:%u  >0.1:%u",
              app.lastDeltaHistTotal,
              app.lastDeltaHist[0], app.lastDeltaHist[1], app.lastDeltaHist[2], app.lastDeltaHist[3],

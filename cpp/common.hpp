@@ -227,6 +227,7 @@ struct App {
     uint32_t      lastBfIndexCount = 0;
     uint32_t      lastFrustumMeshlets = 0;
     uint32_t      lastDepthRejectedMeshlets = 0;
+    uint32_t      lastBackfaceRejectedMeshlets = 0;
     uint32_t      lastVisibleMeshlets = 0;
     uint32_t      lastDeltaHist[8]    = {0};
     uint32_t      lastDeltaHistTotal  = 0;

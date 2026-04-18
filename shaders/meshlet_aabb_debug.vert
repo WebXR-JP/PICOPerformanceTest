@@ -76,17 +76,20 @@ bool occludedForEye(Meshlet m, uint eye) {
     vec2 texelMin = clamp(floor(rectMin * hiZSize) - vec2(1.0), vec2(0.0), hiZSize - 1.0);
     vec2 texelMax = clamp(ceil(rectMax * hiZSize) + vec2(1.0), vec2(0.0), hiZSize - 1.0);
     float depthLimit = max(nearestDepth + pc.viewportAndBias.z, 0.0);
+    bool hasRendered = false;
     for (int ty = int(texelMin.y); ty <= int(texelMax.y); ++ty) {
         for (int tx = int(texelMin.x); tx <= int(texelMax.x); ++tx) {
             vec2 uv = (vec2(float(tx), float(ty)) + vec2(0.5)) / hiZSize;
             float hRaw = sampleHiZ(eye, uv, lod);
-            float h = (hRaw >= 1e-4 && hRaw <= 1.0) ? hRaw : 1.0;
+            bool valid = (hRaw >= 1e-4 && hRaw < 1.0);
+            float h = valid ? hRaw : 1.0;
+            if (valid) hasRendered = true;
             if (h <= depthLimit) {
                 return false;
             }
         }
     }
-    return true;
+    return hasRendered;  // 実レンダ値が 1 件もなければ遮蔽と判定しない
 }
 
 void main() {
