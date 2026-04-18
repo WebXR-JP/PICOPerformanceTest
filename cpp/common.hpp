@@ -158,6 +158,10 @@ struct XrCtx {
     bool           sessionRunning = false;
     bool           exitRequested  = false;
     std::vector<EyeSwapchain> swapchains;
+
+    XrActionSet    actionSet      = XR_NULL_HANDLE;
+    XrAction       moveAction     = XR_NULL_HANDLE; // vec2f: x=strafe, y=forward
+    XrAction       turnAction     = XR_NULL_HANDLE; // vec2f: x=yaw
 };
 
 extern PFN_xrGetVulkanGraphicsRequirements2KHR pfn_xrGetVulkanGraphicsRequirements2KHR;
@@ -220,8 +224,9 @@ struct App {
     double        lastDownsampleMs = 0.0;
     uint32_t      frameParity      = 0;
     bool          prevDepthValid   = false;
-    bool          frozenViewsValid = false;
-    XrView        frozenViews[2]   = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    glm::vec3     playerPos        = glm::vec3(0.f);
+    float         playerYaw        = 0.f;
+    XrTime        lastFrameTime    = 0;
 
     using Clock = std::chrono::high_resolution_clock;
     Clock::time_point lastLogTime;

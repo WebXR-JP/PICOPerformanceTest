@@ -1,12 +1,14 @@
 #include "render.hpp"
 
 #include "mesh.hpp"
+#include "openxr_setup.hpp"
 
 glm::mat4 CubeModelMatrix() {
     return glm::mat4(1.f);
 }
 
-glm::mat4 ComputeMVP(const XrView& view, const glm::mat4& model) {
+glm::mat4 ComputeMVP(const XrView& view, const glm::mat4& model,
+                     const glm::vec3& playerPos, float playerYaw) {
     const XrFovf& fov = view.fov;
     float l = tanf(fov.angleLeft);
     float r = tanf(fov.angleRight);
@@ -15,18 +17,20 @@ glm::mat4 ComputeMVP(const XrView& view, const glm::mat4& model) {
     float zNear = 0.05f, zFar = 100.f;
     glm::mat4 proj(0.f);
     proj[0][0] = 2.f / (r - l);
-    proj[1][1] = 2.f / (u - d);
+    proj[1][1] = -2.f / (u - d);
     proj[2][0] = (r + l) / (r - l);
     proj[2][1] = (u + d) / (u - d);
-    proj[2][2] = -(zFar + zNear) / (zFar - zNear);
+    proj[2][2] = zNear / (zFar - zNear);
     proj[2][3] = -1.f;
-    proj[3][2] = -(2.f * zFar * zNear) / (zFar - zNear);
+    proj[3][2] = (zNear * zFar) / (zFar - zNear);
 
     const XrQuaternionf& q = view.pose.orientation;
     const XrVector3f&    p = view.pose.position;
     glm::mat4 rot   = glm::mat4_cast(glm::quat(q.w, q.x, q.y, q.z));
     glm::mat4 trans = glm::translate(glm::mat4(1.f), glm::vec3(p.x, p.y, p.z));
-    glm::mat4 view_mat = glm::inverse(trans * rot);
+    glm::mat4 playerYawMat = glm::rotate(glm::mat4(1.f), playerYaw, glm::vec3(0, 1, 0));
+    glm::mat4 playerTrans  = glm::translate(glm::mat4(1.f), playerPos);
+    glm::mat4 view_mat = glm::inverse(playerTrans * playerYawMat * trans * rot);
 
     return proj * view_mat * model;
 }
@@ -44,8 +48,9 @@ void RenderStereo(App& app, uint32_t imageIdx,
     CheckVkResult(vkBeginCommandBuffer(cmd, &bi));
 
     glm::mat4 model = CubeModelMatrix();
-    glm::mat4 mvp0  = ComputeMVP(views[0], model);
-    glm::mat4 mvp1  = ComputeMVP(views[1], model);
+    glm::mat4 mvp0  = ComputeMVP(views[0], model, app.playerPos, app.playerYaw);
+    glm::mat4 mvp1  = ComputeMVP(views[1], model, app.playerPos, app.playerYaw);
+
 
     if (IsValid(app.vk.queryPool)) {
         vkCmdResetQueryPool(cmd, Raw(app.vk.queryPool), 0, TS_COUNT);
@@ -128,17 +133,19 @@ void RenderStereo(App& app, uint32_t imageIdx,
     SkinCullLdsPC lpc{};
     lpc.mvp[0]       = mvp0;
     lpc.mvp[1]       = mvp1;
-    lpc.camPos[0]    = glm::vec4(views[0].pose.position.x,
-                                 views[0].pose.position.y,
-                                 views[0].pose.position.z, 0.0f);
-    lpc.camPos[1]    = glm::vec4(views[1].pose.position.x,
-                                 views[1].pose.position.y,
-                                 views[1].pose.position.z, 0.0f);
+    glm::mat4 playerYawMat = glm::rotate(glm::mat4(1.f), app.playerYaw, glm::vec3(0, 1, 0));
+    auto cam_world = [&](const XrView& v) {
+        glm::vec3 vp(v.pose.position.x, v.pose.position.y, v.pose.position.z);
+        glm::vec3 w = glm::vec3(playerYawMat * glm::vec4(vp, 1.f)) + app.playerPos;
+        return glm::vec4(w, 0.f);
+    };
+    lpc.camPos[0]    = cam_world(views[0]);
+    lpc.camPos[1]    = cam_world(views[1]);
     lpc.meshletCount = app.vk.meshletCount;
     lpc.cullEnabled  = 1u;
     lpc.frustumEnabled = (uint32_t)app.mode7Frustum;
     lpc.prevDepthEnabled = app.prevDepthValid ? 1u : 0u;
-    lpc.prevDepthParams = glm::vec4((float)swapW, (float)swapH, 0.02f,
+    lpc.prevDepthParams = glm::vec4((float)swapW, (float)swapH, 0.0001f,
                                     (float)app.xr.swapchains[0].hiZMipCount);
     vkCmdPushConstants(cmd, Raw(app.vk.skinCullLdsPipelineLayout),
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lpc), &lpc);
@@ -246,8 +253,8 @@ void RenderStereo(App& app, uint32_t imageIdx,
     depthAtt.imageView              = Raw(sc.depthView);
     depthAtt.imageLayout            = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL_KHR;
     depthAtt.loadOp                 = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAtt.storeOp                = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthAtt.clearValue.depthStencil = {1.0f, 0};
+    depthAtt.storeOp                = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAtt.clearValue.depthStencil = {0.0f, 0};
 
     VkRenderingInfoKHR ri{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
     ri.renderArea.offset        = {0, 0};
@@ -295,7 +302,7 @@ void RenderStereo(App& app, uint32_t imageIdx,
     } dbgPc{};
     dbgPc.mvp[0] = mvp0;
     dbgPc.mvp[1] = mvp1;
-    dbgPc.viewportAndBias = glm::vec4((float)swapW, (float)swapH, 0.02f,
+    dbgPc.viewportAndBias = glm::vec4((float)swapW, (float)swapH, 0.001f,
                                       (float)app.xr.swapchains[0].hiZMipCount);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Raw(app.vk.meshletDebugPipeline));
     {
@@ -437,6 +444,8 @@ void RenderFrame(App& app) {
     CHECK_XR(xrWaitFrame(app.xr.session, &fwi, &fst));
     CHECK_XR(xrBeginFrame(app.xr.session, nullptr));
 
+    PollXrInput(app, fst.predictedDisplayTime);
+
     std::vector<XrCompositionLayerBaseHeader*> layers;
     XrCompositionLayerProjection projLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     std::vector<XrCompositionLayerProjectionView> projViews;
@@ -451,13 +460,7 @@ void RenderFrame(App& app) {
         XrViewState vs{XR_TYPE_VIEW_STATE};
         CHECK_XR(xrLocateViews(app.xr.session, &vli, &vs,
                                viewCount, &viewCount, views.data()));
-        if (!app.frozenViewsValid && viewCount == 2) {
-            app.frozenViews[0] = views[0];
-            app.frozenViews[1] = views[1];
-            app.frozenViewsValid = true;
-            LOGI("Frozen render views captured");
-        }
-        const XrView* renderViews = app.frozenViewsValid ? app.frozenViews : views.data();
+        const XrView* renderViews = views.data();
 
         projViews.resize(viewCount);
 

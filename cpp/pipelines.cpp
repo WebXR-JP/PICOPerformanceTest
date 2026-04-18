@@ -115,7 +115,7 @@ void CreateVsSkinPipeline(App& app, uint32_t width, uint32_t height) {
     VkPipelineDepthStencilStateCreateInfo dsCI{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     dsCI.depthTestEnable  = VK_TRUE;
     dsCI.depthWriteEnable = VK_TRUE;
-    dsCI.depthCompareOp   = VK_COMPARE_OP_LESS;
+    dsCI.depthCompareOp   = VK_COMPARE_OP_GREATER;
     VkPipelineColorBlendAttachmentState cbAtt[3]{};
     cbAtt[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -470,7 +470,7 @@ void CreateFrameResources(App& app, VkFormat colorFormat) {
 
         CreateImage(app.vk, sc.hiZW, sc.hiZH,
                     VK_FORMAT_R32_SFLOAT,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     sc.hiZImages[ping],
                     2, sc.hiZMipCount);
         sc.hiZViews[ping] = CreateImageView(
@@ -519,6 +519,26 @@ void CreateFrameResources(App& app, VkFormat colorFormat) {
 
     for (uint32_t ping = 0; ping < 2; ++ping) {
         TransitionImageLayoutNow(app.vk, Raw(sc.hiZImages[ping]), VK_IMAGE_ASPECT_COLOR_BIT,
-                                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 2, sc.hiZMipCount);
+                                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 2, sc.hiZMipCount);
+        auto cmdBuffers = app.vk.device.allocateCommandBuffers(
+            vk::CommandBufferAllocateInfo(Raw(app.vk.cmdPool), vk::CommandBufferLevel::ePrimary, 1));
+        auto& cmd = cmdBuffers.front();
+        cmd.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+        VkClearColorValue clearVal{};
+        clearVal.float32[0] = 0.0f;
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, sc.hiZMipCount, 0, 2};
+        vkCmdClearColorImage(Raw(cmd), Raw(sc.hiZImages[ping]),
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearVal, 1, &range);
+        cmd.end();
+        vk::CommandBuffer submitCmd = Raw(cmd);
+        vk::SubmitInfo si{};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &submitCmd;
+        app.vk.queue.submit(si, nullptr);
+        app.vk.queue.waitIdle();
+        TransitionImageLayoutNow(app.vk, Raw(sc.hiZImages[ping]), VK_IMAGE_ASPECT_COLOR_BIT,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                                 2, sc.hiZMipCount);
     }
 }

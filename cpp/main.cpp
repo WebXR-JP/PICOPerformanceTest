@@ -42,6 +42,7 @@ void Initialize(App& app) {
     CreateVulkanDevice(app);
     CreateXrSession(app);
     CreateSwapchains(app);
+    CreateXrInput(app);
 
     app.vk.colorFormat = VK_FORMAT_R8G8B8A8_SRGB;
 

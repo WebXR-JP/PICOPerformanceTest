@@ -54,7 +54,7 @@ float chooseHiZMip(vec2 rectSizePx) {
 bool occludedForEye(Meshlet m, uint eye) {
     vec2 minUv = vec2(1e9);
     vec2 maxUv = vec2(-1e9);
-    float nearestDepth = 1.0;
+    float nearestDepth = 0.0;
     bool anyValid = false;
     for (int i = 0; i < 8; ++i) {
         vec4 clip = pc.mvp[eye] * vec4(cornerOf(m, i), 1.0);
@@ -63,7 +63,7 @@ bool occludedForEye(Meshlet m, uint eye) {
         vec2 uv = ndc.xy * 0.5 + 0.5;
         minUv = min(minUv, uv);
         maxUv = max(maxUv, uv);
-        nearestDepth = min(nearestDepth, ndc.z * 0.5 + 0.5);
+        nearestDepth = max(nearestDepth, ndc.z);
         anyValid = true;
     }
     if (!anyValid) return false;
@@ -75,11 +75,11 @@ bool occludedForEye(Meshlet m, uint eye) {
     vec2 hiZSize = max(ceil(pc.viewportAndBias.xy / texelSpanPx), vec2(1.0));
     vec2 texelMin = clamp(floor(rectMin * hiZSize) - vec2(1.0), vec2(0.0), hiZSize - 1.0);
     vec2 texelMax = clamp(ceil(rectMax * hiZSize) + vec2(1.0), vec2(0.0), hiZSize - 1.0);
-    float depthLimit = min(nearestDepth - pc.viewportAndBias.z, 1.0);
+    float depthLimit = max(nearestDepth + pc.viewportAndBias.z, 0.0);
     for (int ty = int(texelMin.y); ty <= int(texelMax.y); ++ty) {
         for (int tx = int(texelMin.x); tx <= int(texelMax.x); ++tx) {
             vec2 uv = (vec2(float(tx), float(ty)) + vec2(0.5)) / hiZSize;
-            if (sampleHiZ(eye, uv, lod) >= depthLimit) {
+            if (max(sampleHiZ(eye, uv, lod), 0.0) <= depthLimit) {
                 return false;
             }
         }

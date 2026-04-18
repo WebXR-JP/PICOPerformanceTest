@@ -41,7 +41,7 @@ ivec2 ClampSrc(ivec2 p) {
 }
 
 float Reduce4(float a, float b, float c, float d) {
-    return max(max(a, b), max(c, d));
+    return min(min(a, b), min(c, d));
 }
 
 float ReduceQuad(float v) {
@@ -275,6 +275,12 @@ void main() {
     uint x = subXY.x + 8u * ((gl_LocalInvocationIndex >> 6u) & 1u);
     uint y = subXY.y + 8u * (gl_LocalInvocationIndex >> 7u);
     uvec2 workGroupID = gl_WorkGroupID.xy;
+
+    // 明示的にゼロ初期化（reverse-Z では 0 = far = 無効タイル相当）
+    for (uint i = gl_LocalInvocationIndex; i < 16u * 16u; i += 256u) {
+        spdIntermediate[i / 16u][i % 16u] = 0.0;
+    }
+    barrier();
 
     DownsampleMips01(x, y, workGroupID, eye);
     DownsampleNextFour(x, y, workGroupID, eye, 2);

@@ -27,6 +27,7 @@ void CreateXrInstance(App& app) {
     const char* extensions[] = {
         "XR_KHR_android_create_instance",
         "XR_KHR_vulkan_enable2",
+        "XR_BD_controller_interaction",
     };
 
     XrInstanceCreateInfoAndroidKHR androidInfo{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -207,11 +208,20 @@ void CreateXrSession(App& app) {
     CHECK_XR(xrCreateSession(app.xr.instance, &sci, &app.xr.session));
     LOGI("XrSession created");
 
+    uint32_t spaceCount = 0;
+    CHECK_XR(xrEnumerateReferenceSpaces(app.xr.session, 0, &spaceCount, nullptr));
+    std::vector<XrReferenceSpaceType> supportedSpaces(spaceCount);
+    CHECK_XR(xrEnumerateReferenceSpaces(app.xr.session, spaceCount, &spaceCount, supportedSpaces.data()));
+    bool hasStage = false;
+    for (auto t : supportedSpaces) if (t == XR_REFERENCE_SPACE_TYPE_STAGE) hasStage = true;
+
     XrReferenceSpaceCreateInfo rci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-    rci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    rci.referenceSpaceType = hasStage ? XR_REFERENCE_SPACE_TYPE_STAGE
+                                       : XR_REFERENCE_SPACE_TYPE_LOCAL;
     rci.poseInReferenceSpace.orientation = {0, 0, 0, 1};
     rci.poseInReferenceSpace.position    = {0, 0, 0};
     CHECK_XR(xrCreateReferenceSpace(app.xr.session, &rci, &app.xr.appSpace));
+    LOGI("appSpace type: %s", hasStage ? "STAGE" : "LOCAL");
 }
 
 void CreateSwapchains(App& app) {
@@ -270,4 +280,107 @@ void CreateSwapchains(App& app) {
         sc.images[i].image = xrImages[i].image;
     }
     LOGI("Stereo swapchain: %dx%d arraySize=2, %d images", sc.width, sc.height, imgCount);
+}
+
+void CreateXrInput(App& app) {
+    XrActionSetCreateInfo asci{XR_TYPE_ACTION_SET_CREATE_INFO};
+    strcpy(asci.actionSetName,          "locomotion");
+    strcpy(asci.localizedActionSetName, "Locomotion");
+    asci.priority = 0;
+    CHECK_XR(xrCreateActionSet(app.xr.instance, &asci, &app.xr.actionSet));
+
+    auto makeAction = [&](const char* name, const char* locName, XrActionType type) {
+        XrActionCreateInfo aci{XR_TYPE_ACTION_CREATE_INFO};
+        strcpy(aci.actionName,          name);
+        strcpy(aci.localizedActionName, locName);
+        aci.actionType = type;
+        XrAction a = XR_NULL_HANDLE;
+        CHECK_XR(xrCreateAction(app.xr.actionSet, &aci, &a));
+        return a;
+    };
+    app.xr.moveAction = makeAction("move", "Move",  XR_ACTION_TYPE_VECTOR2F_INPUT);
+    app.xr.turnAction = makeAction("turn", "Turn",  XR_ACTION_TYPE_VECTOR2F_INPUT);
+
+    XrPath leftStick = 0, rightStick = 0;
+    CHECK_XR(xrStringToPath(app.xr.instance, "/user/hand/left/input/thumbstick",  &leftStick));
+    CHECK_XR(xrStringToPath(app.xr.instance, "/user/hand/right/input/thumbstick", &rightStick));
+
+    XrActionSuggestedBinding bindings[2];
+    bindings[0] = {app.xr.moveAction, leftStick};
+    bindings[1] = {app.xr.turnAction, rightStick};
+
+    const char* profiles[] = {
+        "/interaction_profiles/khr/simple_controller",
+        "/interaction_profiles/oculus/touch_controller",
+        "/interaction_profiles/bytedance/pico_neo3_controller",
+        "/interaction_profiles/bytedance/pico4_controller",
+    };
+    for (const char* p : profiles) {
+        XrPath profilePath = 0;
+        XrResult r = xrStringToPath(app.xr.instance, p, &profilePath);
+        if (XR_FAILED(r)) continue;
+        XrInteractionProfileSuggestedBinding s{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        s.interactionProfile = profilePath;
+        s.countSuggestedBindings = 2;
+        s.suggestedBindings = bindings;
+        XrResult sr = xrSuggestInteractionProfileBindings(app.xr.instance, &s);
+        if (XR_FAILED(sr)) {
+            LOGI("Suggest bindings failed for %s: %d", p, (int)sr);
+        }
+    }
+
+    XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+    attach.countActionSets = 1;
+    attach.actionSets = &app.xr.actionSet;
+    CHECK_XR(xrAttachSessionActionSets(app.xr.session, &attach));
+
+    LOGI("OpenXR input: locomotion action set attached");
+}
+
+void PollXrInput(App& app, XrTime predictedDisplayTime) {
+    if (!app.xr.actionSet) return;
+
+    XrActiveActionSet active{app.xr.actionSet, XR_NULL_PATH};
+    XrActionsSyncInfo si{XR_TYPE_ACTIONS_SYNC_INFO};
+    si.countActiveActionSets = 1;
+    si.activeActionSets = &active;
+    XrResult sr = xrSyncActions(app.xr.session, &si);
+    if (XR_FAILED(sr)) return;
+
+    auto readVec2 = [&](XrAction a, float& x, float& y) {
+        x = 0; y = 0;
+        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = a;
+        XrActionStateVector2f st{XR_TYPE_ACTION_STATE_VECTOR2F};
+        if (XR_SUCCEEDED(xrGetActionStateVector2f(app.xr.session, &gi, &st)) && st.isActive) {
+            x = st.currentState.x;
+            y = st.currentState.y;
+        }
+    };
+
+    float mx = 0, my = 0, tx = 0, ty = 0;
+    readVec2(app.xr.moveAction, mx, my);
+    readVec2(app.xr.turnAction, tx, ty);
+
+    float dt = 0.f;
+    if (app.lastFrameTime != 0) {
+        dt = (float)((predictedDisplayTime - app.lastFrameTime) * 1e-9);
+    }
+    app.lastFrameTime = predictedDisplayTime;
+    if (dt > 0.1f) dt = 0.1f;
+
+    const float moveSpeed = 2.0f;  // m/s
+    const float turnSpeed = glm::radians(90.f); // rad/s (smooth turn)
+    const float deadzone  = 0.15f;
+
+    auto dz = [&](float v) { return fabsf(v) < deadzone ? 0.f : v; };
+    mx = dz(mx); my = dz(my); tx = dz(tx); ty = dz(ty);
+
+    // move in yaw-rotated XZ plane (forward = -Z in view, right = +X)
+    float c = cosf(app.playerYaw), s = sinf(app.playerYaw);
+    glm::vec3 forward( -s, 0,  -c);
+    glm::vec3 right  (  c, 0,  -s);
+    app.playerPos += (right * mx + forward * my) * (moveSpeed * dt);
+    app.playerPos.y += ty * moveSpeed * dt;
+    app.playerYaw -= tx * turnSpeed * dt;
 }

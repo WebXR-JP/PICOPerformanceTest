@@ -8,3 +8,5 @@ void CreateXrInstance(App& app);
 void CreateVulkanDevice(App& app);
 void CreateXrSession(App& app);
 void CreateSwapchains(App& app);
+void CreateXrInput(App& app);
+void PollXrInput(App& app, XrTime predictedDisplayTime);

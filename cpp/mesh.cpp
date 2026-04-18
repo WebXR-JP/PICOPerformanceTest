@@ -90,7 +90,7 @@ void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
 
         glm::vec3 center(
             (gx - (GX - 1) * 0.5f) * spacing,
-            (gy - (GY - 1) * 0.5f) * spacing,
+            (gy - (GY - 1) * 0.5f) * spacing + 1.5f,
             -3.0f - (gz - (GZ - 1) * 0.5f) * spacing);
 
         for (int b = 0; b < BONES_PER_CUBE; b++) {
