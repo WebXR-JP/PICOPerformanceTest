@@ -47,7 +47,7 @@ float sampleHiZ(uint eye, vec2 uv, float lod) {
 
 float chooseHiZMip(vec2 rectSizePx) {
     float maxExtentHiZ = max(max(rectSizePx.x, rectSizePx.y) * 0.5, 1.0);
-    float maxMip = max(pc.viewportAndBias.w - 1.0, 0.0);
+    float maxMip = min(max(pc.viewportAndBias.w - 1.0, 0.0), 3.0);
     return clamp(max(ceil(log2(maxExtentHiZ)) - 1.0, 0.0), 0.0, maxMip);
 }
 
@@ -79,7 +79,9 @@ bool occludedForEye(Meshlet m, uint eye) {
     for (int ty = int(texelMin.y); ty <= int(texelMax.y); ++ty) {
         for (int tx = int(texelMin.x); tx <= int(texelMax.x); ++tx) {
             vec2 uv = (vec2(float(tx), float(ty)) + vec2(0.5)) / hiZSize;
-            if (max(sampleHiZ(eye, uv, lod), 0.0) <= depthLimit) {
+            float hRaw = sampleHiZ(eye, uv, lod);
+            float h = (hRaw >= 1e-4 && hRaw <= 1.0) ? hRaw : 1.0;
+            if (h <= depthLimit) {
                 return false;
             }
         }
@@ -90,14 +92,10 @@ bool occludedForEye(Meshlet m, uint eye) {
 void main() {
     Meshlet m = meshlets[gl_InstanceIndex];
     bool occluded = occludedForEye(m, uint(gl_ViewIndex));
-    if (!occluded) {
-        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-        outColor = vec4(0.0);
-        return;
-    }
 
     ivec2 edge = edgeVerts(gl_VertexIndex / 2);
     int cornerIdx = ((gl_VertexIndex & 1) == 0) ? edge.x : edge.y;
     gl_Position = pc.mvp[gl_ViewIndex] * vec4(cornerOf(m, cornerIdx), 1.0);
-    outColor = vec4(1.0, 0.15, 0.1, 1.0);
+    outColor = occluded ? vec4(1.0, 0.15, 0.1, 1.0)    // 赤 = reject
+                        : vec4(0.1, 1.0, 0.3, 1.0);    // 緑 = visible
 }

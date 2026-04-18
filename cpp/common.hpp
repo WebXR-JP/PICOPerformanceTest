@@ -137,6 +137,12 @@ struct VulkanCtx {
     vk::raii::DescriptorSetLayout           hiZSpdDescLayout{nullptr};
     vk::raii::PipelineLayout                hiZSpdPipelineLayout{nullptr};
     vk::raii::Pipeline                      hiZSpdPipeline{nullptr};
+    vk::raii::DescriptorSetLayout           hiZNaiveInitDescLayout{nullptr};
+    vk::raii::PipelineLayout                hiZNaiveInitPipelineLayout{nullptr};
+    vk::raii::Pipeline                      hiZNaiveInitPipeline{nullptr};
+    vk::raii::DescriptorSetLayout           hiZNaiveStepDescLayout{nullptr};
+    vk::raii::PipelineLayout                hiZNaiveStepPipelineLayout{nullptr};
+    vk::raii::Pipeline                      hiZNaiveStepPipeline{nullptr};
     vk::raii::DescriptorSetLayout           meshletDebugDescLayout{nullptr};
     vk::raii::PipelineLayout                meshletDebugPipelineLayout{nullptr};
     vk::raii::Pipeline                      meshletDebugPipeline{nullptr};
@@ -164,6 +170,8 @@ struct XrCtx {
     XrActionSet    actionSet      = XR_NULL_HANDLE;
     XrAction       moveAction     = XR_NULL_HANDLE; // vec2f: x=strafe, y=forward
     XrAction       turnAction     = XR_NULL_HANDLE; // vec2f: x=yaw
+    XrAction       debugToggleAction = XR_NULL_HANDLE; // bool: toggle AABB debug
+    bool           debugTogglePrev = false;
 };
 
 extern PFN_xrGetVulkanGraphicsRequirements2KHR pfn_xrGetVulkanGraphicsRequirements2KHR;
@@ -235,6 +243,7 @@ struct App {
     glm::vec3     playerPos        = glm::vec3(0.f);
     float         playerYaw        = 0.f;
     XrTime        lastFrameTime    = 0;
+    bool          debugAabbEnabled = true;
 
     using Clock = std::chrono::high_resolution_clock;
     Clock::time_point lastLogTime;

@@ -298,16 +298,21 @@ void CreateXrInput(App& app) {
         CHECK_XR(xrCreateAction(app.xr.actionSet, &aci, &a));
         return a;
     };
-    app.xr.moveAction = makeAction("move", "Move",  XR_ACTION_TYPE_VECTOR2F_INPUT);
-    app.xr.turnAction = makeAction("turn", "Turn",  XR_ACTION_TYPE_VECTOR2F_INPUT);
+    app.xr.moveAction        = makeAction("move",         "Move",         XR_ACTION_TYPE_VECTOR2F_INPUT);
+    app.xr.turnAction        = makeAction("turn",         "Turn",         XR_ACTION_TYPE_VECTOR2F_INPUT);
+    app.xr.debugToggleAction = makeAction("debug_toggle", "Debug Toggle", XR_ACTION_TYPE_BOOLEAN_INPUT);
 
-    XrPath leftStick = 0, rightStick = 0;
+    XrPath leftStick = 0, rightStick = 0, rightA = 0, rightTrigger = 0, leftMenu = 0;
     CHECK_XR(xrStringToPath(app.xr.instance, "/user/hand/left/input/thumbstick",  &leftStick));
     CHECK_XR(xrStringToPath(app.xr.instance, "/user/hand/right/input/thumbstick", &rightStick));
+    CHECK_XR(xrStringToPath(app.xr.instance, "/user/hand/right/input/a/click",    &rightA));
+    CHECK_XR(xrStringToPath(app.xr.instance, "/user/hand/right/input/trigger/click", &rightTrigger));
+    CHECK_XR(xrStringToPath(app.xr.instance, "/user/hand/left/input/menu/click",  &leftMenu));
 
-    XrActionSuggestedBinding bindings[2];
+    XrActionSuggestedBinding bindings[3];
     bindings[0] = {app.xr.moveAction, leftStick};
     bindings[1] = {app.xr.turnAction, rightStick};
+    bindings[2] = {app.xr.debugToggleAction, rightA};  // default: A button
 
     const char* profiles[] = {
         "/interaction_profiles/khr/simple_controller",
@@ -319,15 +324,20 @@ void CreateXrInput(App& app) {
         XrPath profilePath = 0;
         XrResult r = xrStringToPath(app.xr.instance, p, &profilePath);
         if (XR_FAILED(r)) continue;
+        // simple_controller lacks A button — use trigger instead
+        bool isSimple = strstr(p, "simple_controller") != nullptr;
+        XrActionSuggestedBinding localBindings[3] = {bindings[0], bindings[1], bindings[2]};
+        if (isSimple) localBindings[2].binding = rightTrigger;
         XrInteractionProfileSuggestedBinding s{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
         s.interactionProfile = profilePath;
-        s.countSuggestedBindings = 2;
-        s.suggestedBindings = bindings;
+        s.countSuggestedBindings = 3;
+        s.suggestedBindings = localBindings;
         XrResult sr = xrSuggestInteractionProfileBindings(app.xr.instance, &s);
         if (XR_FAILED(sr)) {
             LOGI("Suggest bindings failed for %s: %d", p, (int)sr);
         }
     }
+    (void)leftMenu;
 
     XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
     attach.countActionSets = 1;
@@ -361,6 +371,20 @@ void PollXrInput(App& app, XrTime predictedDisplayTime) {
     float mx = 0, my = 0, tx = 0, ty = 0;
     readVec2(app.xr.moveAction, mx, my);
     readVec2(app.xr.turnAction, tx, ty);
+
+    {
+        XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = app.xr.debugToggleAction;
+        XrActionStateBoolean st{XR_TYPE_ACTION_STATE_BOOLEAN};
+        if (XR_SUCCEEDED(xrGetActionStateBoolean(app.xr.session, &gi, &st)) && st.isActive) {
+            bool pressed = st.currentState != XR_FALSE;
+            if (pressed && !app.xr.debugTogglePrev) {
+                app.debugAabbEnabled = !app.debugAabbEnabled;
+                LOGI("AABB debug draw: %s", app.debugAabbEnabled ? "ON" : "OFF");
+            }
+            app.xr.debugTogglePrev = pressed;
+        }
+    }
 
     float dt = 0.f;
     if (app.lastFrameTime != 0) {

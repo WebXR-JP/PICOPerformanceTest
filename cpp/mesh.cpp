@@ -172,7 +172,13 @@ void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                     }
                     {
                         glm::vec3 cc = 0.5f * (pMin + pMax);
-                        glm::vec3 hh = 0.5f * (pMax - pMin) * 1.3f;
+                        glm::vec3 ext = pMax - pMin;
+                        int thinAxis = 0;
+                        if (ext[1] < ext[thinAxis]) thinAxis = 1;
+                        if (ext[2] < ext[thinAxis]) thinAxis = 2;
+                        glm::vec3 scale(1.1f);
+                        scale[thinAxis] = 1.5f;
+                        glm::vec3 hh = 0.5f * ext * scale;
                         pMin = cc - hh;
                         pMax = cc + hh;
                     }

@@ -142,10 +142,10 @@ void RenderStereo(App& app, uint32_t imageIdx,
     lpc.camPos[0]    = cam_world(views[0]);
     lpc.camPos[1]    = cam_world(views[1]);
     lpc.meshletCount = app.vk.meshletCount;
-    lpc.cullEnabled  = 1u;
+    lpc.cullEnabled  = 0u;  // 一時的に triangle backface cull 無効
     lpc.frustumEnabled = (uint32_t)app.mode7Frustum;
     lpc.prevDepthEnabled = app.prevDepthValid ? 1u : 0u;
-    lpc.prevDepthParams = glm::vec4((float)swapW, (float)swapH, 0.0001f,
+    lpc.prevDepthParams = glm::vec4((float)swapW, (float)swapH, 0.0003f,
                                     (float)app.xr.swapchains[0].hiZMipCount);
     vkCmdPushConstants(cmd, Raw(app.vk.skinCullLdsPipelineLayout),
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lpc), &lpc);
@@ -298,38 +298,40 @@ void RenderStereo(App& app, uint32_t imageIdx,
     vkCmdBindIndexBuffer(cmd, Raw(app.vk.compactIndexBuffer), 0, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexedIndirect(cmd, Raw(app.vk.bfDrawCmdBuffer), 0, 1, 0);
 
-    struct MeshletDebugPC {
-        glm::mat4 mvp[2];
-        glm::vec4 viewportAndBias;
-    } dbgPc{};
-    dbgPc.mvp[0] = mvp0;
-    dbgPc.mvp[1] = mvp1;
-    dbgPc.viewportAndBias = glm::vec4((float)swapW, (float)swapH, 0.001f,
-                                      (float)app.xr.swapchains[0].hiZMipCount);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Raw(app.vk.meshletDebugPipeline));
-    {
-        VkDescriptorBufferInfo meshletBuf{Raw(app.vk.meshletBuffer), 0, VK_WHOLE_SIZE};
-        VkDescriptorImageInfo hiZImg{};
-        hiZImg.sampler     = Raw(app.vk.hiZSampler);
-        hiZImg.imageView   = Raw(sc.hiZViews[prevDepthReadIdx]);
-        hiZImg.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkWriteDescriptorSet w[2]{};
-        w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w[0].dstBinding      = 0;
-        w[0].descriptorCount = 1;
-        w[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        w[0].pBufferInfo     = &meshletBuf;
-        w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w[1].dstBinding      = 1;
-        w[1].descriptorCount = 1;
-        w[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w[1].pImageInfo      = &hiZImg;
-        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                  Raw(app.vk.meshletDebugPipelineLayout), 0, 2, w);
+    if (app.debugAabbEnabled) {
+        struct MeshletDebugPC {
+            glm::mat4 mvp[2];
+            glm::vec4 viewportAndBias;
+        } dbgPc{};
+        dbgPc.mvp[0] = mvp0;
+        dbgPc.mvp[1] = mvp1;
+        dbgPc.viewportAndBias = glm::vec4((float)swapW, (float)swapH, 0.0003f,
+                                          (float)app.xr.swapchains[0].hiZMipCount);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, Raw(app.vk.meshletDebugPipeline));
+        {
+            VkDescriptorBufferInfo meshletBuf{Raw(app.vk.meshletBuffer), 0, VK_WHOLE_SIZE};
+            VkDescriptorImageInfo hiZImg{};
+            hiZImg.sampler     = Raw(app.vk.hiZSampler);
+            hiZImg.imageView   = Raw(sc.hiZViews[prevDepthReadIdx]);
+            hiZImg.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkWriteDescriptorSet w[2]{};
+            w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[0].dstBinding      = 0;
+            w[0].descriptorCount = 1;
+            w[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w[0].pBufferInfo     = &meshletBuf;
+            w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[1].dstBinding      = 1;
+            w[1].descriptorCount = 1;
+            w[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[1].pImageInfo      = &hiZImg;
+            vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      Raw(app.vk.meshletDebugPipelineLayout), 0, 2, w);
+        }
+        vkCmdPushConstants(cmd, Raw(app.vk.meshletDebugPipelineLayout),
+                           VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(dbgPc), &dbgPc);
+        vkCmdDraw(cmd, 24u, app.vk.meshletCount, 0u, 0u);
     }
-    vkCmdPushConstants(cmd, Raw(app.vk.meshletDebugPipelineLayout),
-                       VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(dbgPc), &dbgPc);
-    vkCmdDraw(cmd, 24u, app.vk.meshletCount, 0u, 0u);
 
     vkCmdEndRenderingKHR(cmd);
 
@@ -374,58 +376,103 @@ void RenderStereo(App& app, uint32_t imageIdx,
                                Raw(app.vk.queryPool), TS_HIZ_BEGIN);
     }
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, Raw(app.vk.hiZSpdPipeline));
+    // ---- Naive multi-pass Hi-Z generation ----
+    // Pass 0: source depth → hiZ mip 0
     {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, Raw(app.vk.hiZNaiveInitPipeline));
         VkDescriptorImageInfo srcInfo{};
         srcInfo.sampler     = Raw(app.vk.prevDepthSampler);
         srcInfo.imageView   = Raw(sc.depthSampleView);
         srcInfo.imageLayout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL_KHR;
-        VkDescriptorBufferInfo counterInfo{Raw(app.vk.hiZSpdAtomicBuffer), 0, sizeof(uint32_t) * 2u};
-        std::vector<VkDescriptorImageInfo> mipInfos(13);
-        for (uint32_t i = 0; i < 13; ++i) {
-            const uint32_t level = std::min<uint32_t>(i == 0 ? 5u : (i - 1u), sc.hiZMipCount - 1u);
-            mipInfos[i].imageView   = Raw(sc.hiZMipViews[prevDepthWriteIdx][level]);
-            mipInfos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        }
-        std::vector<VkWriteDescriptorSet> w(15);
+        VkDescriptorImageInfo dstInfo{};
+        dstInfo.imageView   = Raw(sc.hiZMipViews[prevDepthWriteIdx][0]);
+        dstInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet w[2]{};
         w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[0].dstBinding = 0; w[0].descriptorCount = 1;
         w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[0].pImageInfo = &srcInfo;
         w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[1].dstBinding = 1; w[1].descriptorCount = 1;
-        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        w[1].pBufferInfo = &counterInfo;
-        for (uint32_t i = 0; i < 13; ++i) {
-            w[i + 2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            w[i + 2].dstBinding      = i + 2;
-            w[i + 2].descriptorCount = 1;
-            w[i + 2].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            w[i + 2].pImageInfo      = &mipInfos[i];
-        }
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w[1].pImageInfo = &dstInfo;
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                  Raw(app.vk.hiZSpdPipelineLayout), 0,
-                                  (uint32_t)w.size(), w.data());
+                                  Raw(app.vk.hiZNaiveInitPipelineLayout), 0, 2, w);
+        int32_t pc[4] = {(int32_t)sc.width, (int32_t)sc.height, (int32_t)sc.hiZW, (int32_t)sc.hiZH};
+        vkCmdPushConstants(cmd, Raw(app.vk.hiZNaiveInitPipelineLayout),
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        uint32_t gx = (sc.hiZW + 7u) / 8u;
+        uint32_t gy = (sc.hiZH + 7u) / 8u;
+        vkCmdDispatch(cmd, gx, gy, 2u);
     }
-    vkCmdPushConstants(cmd, Raw(app.vk.hiZSpdPipelineLayout),
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(spdPc), &spdPc);
-    vkCmdDispatch(cmd, spdDispatchX, spdDispatchY, 2u);
 
-    VkImageMemoryBarrier2KHR hiZBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
-    hiZBarrier.srcStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
-    hiZBarrier.srcAccessMask       = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
-    hiZBarrier.dstStageMask        = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
-    hiZBarrier.dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT_KHR;
-    hiZBarrier.oldLayout           = VK_IMAGE_LAYOUT_GENERAL;
-    hiZBarrier.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
-    hiZBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hiZBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    hiZBarrier.image               = Raw(sc.hiZImages[prevDepthWriteIdx]);
-    hiZBarrier.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, sc.hiZMipCount, 0, 2};
-    {
+    auto mipBarrier = [&](uint32_t mip) {
+        VkImageMemoryBarrier2KHR b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
+        b.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        b.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+        b.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT_KHR | VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+        b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = Raw(sc.hiZImages[prevDepthWriteIdx]);
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, 2};
         VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
         dep.imageMemoryBarrierCount = 1;
-        dep.pImageMemoryBarriers    = &hiZBarrier;
+        dep.pImageMemoryBarriers    = &b;
+        vkCmdPipelineBarrier2KHR(cmd, &dep);
+    };
+
+    // Subsequent passes: hiZ mip i-1 → hiZ mip i
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, Raw(app.vk.hiZNaiveStepPipeline));
+    uint32_t prevW = sc.hiZW, prevH = sc.hiZH;
+    for (uint32_t i = 1; i < sc.hiZMipCount; ++i) {
+        mipBarrier(i - 1u);  // ensure previous mip's write is visible
+        uint32_t dstW = std::max<uint32_t>(1u, (prevW + 1u) / 2u);
+        uint32_t dstH = std::max<uint32_t>(1u, (prevH + 1u) / 2u);
+        VkDescriptorImageInfo srcInfo{};
+        srcInfo.imageView   = Raw(sc.hiZMipViews[prevDepthWriteIdx][i - 1u]);
+        srcInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo dstInfo{};
+        dstInfo.imageView   = Raw(sc.hiZMipViews[prevDepthWriteIdx][i]);
+        dstInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet w[2]{};
+        w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[0].dstBinding = 0; w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w[0].pImageInfo = &srcInfo;
+        w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[1].dstBinding = 1; w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w[1].pImageInfo = &dstInfo;
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  Raw(app.vk.hiZNaiveStepPipelineLayout), 0, 2, w);
+        int32_t pc[4] = {(int32_t)prevW, (int32_t)prevH, (int32_t)dstW, (int32_t)dstH};
+        vkCmdPushConstants(cmd, Raw(app.vk.hiZNaiveStepPipelineLayout),
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        uint32_t gx = (dstW + 7u) / 8u;
+        uint32_t gy = (dstH + 7u) / 8u;
+        vkCmdDispatch(cmd, gx, gy, 2u);
+        prevW = dstW; prevH = dstH;
+    }
+
+    // Final barrier: all hiZ mips ready for next-frame cull-shader sample
+    {
+        VkImageMemoryBarrier2KHR b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2_KHR};
+        b.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        b.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT_KHR;
+        b.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT_KHR;
+        b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = Raw(sc.hiZImages[prevDepthWriteIdx]);
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, sc.hiZMipCount, 0, 2};
+        VkDependencyInfoKHR dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers    = &b;
         vkCmdPipelineBarrier2KHR(cmd, &dep);
     }
 
@@ -495,11 +542,12 @@ void RenderFrame(App& app) {
         VkFence fence = Raw(app.vk.fence);
         CheckVkResult(vkWaitForFences(Raw(app.vk.device), 1, &fence, VK_TRUE, UINT64_MAX));
 
-        {
-            double elapsed = std::chrono::duration<double>(
-                App::Clock::now() - app.startTime).count();
-            UpdateBones(app.vk, (float)elapsed);
-        }
+        // Skinning disabled for culling debug — bones stay at init-time identity
+        // {
+        //     double elapsed = std::chrono::duration<double>(
+        //         App::Clock::now() - app.startTime).count();
+        //     UpdateBones(app.vk, (float)elapsed);
+        // }
 
         if (IsValid(app.vk.queryPool)) {
             uint64_t ts[TS_COUNT] = {};

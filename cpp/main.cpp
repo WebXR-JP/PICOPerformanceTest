@@ -126,6 +126,12 @@ void Cleanup(App& app) {
         app.vk.hiZSpdPipelineLayout = nullptr;
         app.vk.hiZSpdDescLayout = nullptr;
         app.vk.hiZSpdAtomicBuffer = nullptr;
+        app.vk.hiZNaiveInitPipeline = nullptr;
+        app.vk.hiZNaiveInitPipelineLayout = nullptr;
+        app.vk.hiZNaiveInitDescLayout = nullptr;
+        app.vk.hiZNaiveStepPipeline = nullptr;
+        app.vk.hiZNaiveStepPipelineLayout = nullptr;
+        app.vk.hiZNaiveStepDescLayout = nullptr;
         app.vk.hiZSampler = nullptr;
         app.vk.prevDepthSampler = nullptr;
         app.vk.skinCullLdsPipeline = nullptr;

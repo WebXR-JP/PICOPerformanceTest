@@ -1,0 +1,34 @@
+#version 450
+
+// 素朴多パス Hi-Z 生成: 第 1 パス (source depth → hiZ mip 0)
+// depth == 0 (未描画) は 1.0 (near = min reducer の中立) に置換
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2DArray srcDepth;
+layout(binding = 1, r32f) writeonly uniform image2DArray dstMip0;
+
+layout(push_constant) uniform PC {
+    ivec2 srcSize;
+    ivec2 dstSize;
+} pc;
+
+float load(ivec2 p, int eye) {
+    ivec2 q = clamp(p, ivec2(0), pc.srcSize - 1);
+    float d = texelFetch(srcDepth, ivec3(q, eye), 0).r;
+    return (d > 0.0 && d <= 1.0) ? d : 1.0;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    int eye = int(gl_GlobalInvocationID.z);
+    if (p.x >= pc.dstSize.x || p.y >= pc.dstSize.y || eye >= 2) return;
+
+    ivec2 s = p * 2;
+    float v0 = load(s + ivec2(0,0), eye);
+    float v1 = load(s + ivec2(1,0), eye);
+    float v2 = load(s + ivec2(0,1), eye);
+    float v3 = load(s + ivec2(1,1), eye);
+    float v = min(min(v0, v1), min(v2, v3));
+    imageStore(dstMip0, ivec3(p, eye), vec4(v));
+}

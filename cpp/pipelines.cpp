@@ -4,6 +4,8 @@
 
 #include "fragment_spv.h"
 #include "hiz_spd_spv.h"
+#include "hiz_naive_init_spv.h"
+#include "hiz_naive_step_spv.h"
 #include "meshlet_aabb_debug_frag_spv.h"
 #include "meshlet_aabb_debug_vert_spv.h"
 #include "skin_cull_lds_spv.h"
@@ -296,6 +298,66 @@ void CreateHiZSpdPipeline(App& app) {
     VkPipeline rawPipeline = VK_NULL_HANDLE;
     CheckVkResult(vkCreateComputePipelines(Raw(app.vk.device), VK_NULL_HANDLE, 1, &cpCI, nullptr, &rawPipeline));
     app.vk.hiZSpdPipeline = vk::raii::Pipeline(app.vk.device, rawPipeline);
+
+    // ---- Naive multi-pass Hi-Z pipelines ----
+    auto makeNaivePipeline = [&](const uint32_t* spv, uint32_t size,
+                                 VkDescriptorType srcType,
+                                 vk::raii::DescriptorSetLayout& outDesc,
+                                 vk::raii::PipelineLayout& outLayout,
+                                 vk::raii::Pipeline& outPipe) {
+        VkDescriptorSetLayoutBinding b[2]{};
+        b[0].binding = 0;
+        b[0].descriptorType = srcType;
+        b[0].descriptorCount = 1;
+        b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        b[1].binding = 1;
+        b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[1].descriptorCount = 1;
+        b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo dsl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dsl.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        dsl.bindingCount = 2; dsl.pBindings = b;
+        VkDescriptorSetLayout rawDsl = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateDescriptorSetLayout(Raw(app.vk.device), &dsl, nullptr, &rawDsl));
+        outDesc = vk::raii::DescriptorSetLayout(app.vk.device, rawDsl);
+
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 4};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        VkDescriptorSetLayout rawDslRef = Raw(outDesc);
+        pli.setLayoutCount = 1; pli.pSetLayouts = &rawDslRef;
+        pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
+        VkPipelineLayout rawPli = VK_NULL_HANDLE;
+        CheckVkResult(vkCreatePipelineLayout(Raw(app.vk.device), &pli, nullptr, &rawPli));
+        outLayout = vk::raii::PipelineLayout(app.vk.device, rawPli);
+
+        VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        sm.codeSize = size; sm.pCode = spv;
+        VkShaderModule rawSm = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateShaderModule(Raw(app.vk.device), &sm, nullptr, &rawSm));
+        vk::raii::ShaderModule m(app.vk.device, rawSm);
+
+        VkComputePipelineCreateInfo cp{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cp.stage.module = Raw(m);
+        cp.stage.pName = "main";
+        cp.layout = Raw(outLayout);
+        VkPipeline rawPipe = VK_NULL_HANDLE;
+        CheckVkResult(vkCreateComputePipelines(Raw(app.vk.device), VK_NULL_HANDLE, 1, &cp, nullptr, &rawPipe));
+        outPipe = vk::raii::Pipeline(app.vk.device, rawPipe);
+    };
+
+    makeNaivePipeline(hiz_naive_init_spv, hiz_naive_init_spv_size,
+                      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                      app.vk.hiZNaiveInitDescLayout,
+                      app.vk.hiZNaiveInitPipelineLayout,
+                      app.vk.hiZNaiveInitPipeline);
+
+    makeNaivePipeline(hiz_naive_step_spv, hiz_naive_step_spv_size,
+                      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                      app.vk.hiZNaiveStepDescLayout,
+                      app.vk.hiZNaiveStepPipelineLayout,
+                      app.vk.hiZNaiveStepPipeline);
 }
 
 void CreateMeshletDebugPipeline(App& app, uint32_t width, uint32_t height) {
