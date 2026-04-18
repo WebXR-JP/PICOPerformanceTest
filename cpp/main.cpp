@@ -38,7 +38,6 @@
 #include "fragment_spv.h"
 #include "skin_cull_lds_spv.h"
 #include "hiz_spd_spv.h"
-#include "hiz_downsample_spv.h"
 
 // ---- ログマクロ ----
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  "PICOPerfTest", __VA_ARGS__)
@@ -100,10 +99,7 @@ struct EyeSwapchain {
     VkImageView    motionViews[2]      = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkImage        hiZImages[2]        = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDeviceMemory hiZMemories[2]      = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkImage        motionHalfImages[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkDeviceMemory motionHalfMemories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     std::vector<VkImageView> hiZMipViews[2];
-    std::vector<VkImageView> motionHalfMipViews[2];
     uint32_t       hiZW                = 0;
     uint32_t       hiZH                = 0;
     uint32_t       hiZMipCount         = 0;
@@ -169,11 +165,6 @@ struct VulkanCtx {
     VkDescriptorSet       hiZSpdDescSets[2]        = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkPipelineLayout      hiZSpdPipelineLayout     = VK_NULL_HANDLE;
     VkPipeline            hiZSpdPipeline           = VK_NULL_HANDLE;
-    VkDescriptorSetLayout hiZDownsampleDescLayout  = VK_NULL_HANDLE;
-    VkDescriptorPool      hiZDownsampleDescPool    = VK_NULL_HANDLE;
-    std::vector<VkDescriptorSet> hiZDownsampleDescSets[2];
-    VkPipelineLayout      hiZDownsamplePipelineLayout = VK_NULL_HANDLE;
-    VkPipeline            hiZDownsamplePipeline    = VK_NULL_HANDLE;
 };
 
 // timestamp index 定数
@@ -182,8 +173,8 @@ static constexpr uint32_t TS_CS_BEGIN         = 0;
 static constexpr uint32_t TS_CS_END           = 1;
 static constexpr uint32_t TS_GFX_BEGIN        = 2;
 static constexpr uint32_t TS_GFX_END          = 3;
-static constexpr uint32_t TS_DOWNSAMPLE_BEGIN = 4;
-static constexpr uint32_t TS_DOWNSAMPLE_END   = 5;
+static constexpr uint32_t TS_HIZ_BEGIN        = 4;
+static constexpr uint32_t TS_HIZ_END          = 5;
 static constexpr uint32_t TS_COUNT            = 6;
 static constexpr uint32_t HIZ_SPD_MAX_MIPS    = 12;
 
@@ -713,7 +704,8 @@ struct App {
     uint32_t      lastBfIndexCount = 0; // 前フレームの backface 生存インデックス数
     double        lastCsMs         = 0.0; // 前フレームの CS 時間（ms）
     double        lastGfxMs        = 0.0; // 前フレームの Graphics pass 時間（ms）
-    double        lastDownsampleMs = 0.0; // 前フレームの Hi-Z/MV downsample 時間（ms）
+    double        lastHiZMs        = 0.0; // 前フレームの Hi-Z SPD 時間（ms）
+    double        lastDownsampleMs = 0.0; // 前フレームの Hi-Z 時間（ms）
     uint32_t      frameParity      = 0;
     bool          prevDepthValid   = false;
 
@@ -1318,93 +1310,6 @@ static void CreateSkinCullLdsPipeline(App& app) {
     LOGI("ComputePipeline (skin+cull LDS mode=7) created, meshlets=%u", app.vk.meshletCount);
 }
 
-static void CreateHiZDownsamplePipeline(App& app) {
-    VkDescriptorSetLayoutBinding bindings[2]{};
-    bindings[0].binding = 0;
-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    bindings[1].binding = 1;
-    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutCreateInfo dslCI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslCI.bindingCount = 2;
-    dslCI.pBindings = bindings;
-    CHECK_VK(vkCreateDescriptorSetLayout(app.vk.device, &dslCI, nullptr, &app.vk.hiZDownsampleDescLayout));
-
-    EyeSwapchain& sc = app.xr.swapchains[0];
-    const uint32_t setCountPerPing = sc.hiZMipCount;
-    VkDescriptorPoolSize poolSizes[2] = {
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, setCountPerPing * 2u},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, setCountPerPing * 2u},
-    };
-    VkDescriptorPoolCreateInfo dpCI{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpCI.maxSets = setCountPerPing * 2u;
-    dpCI.poolSizeCount = 2;
-    dpCI.pPoolSizes = poolSizes;
-    CHECK_VK(vkCreateDescriptorPool(app.vk.device, &dpCI, nullptr, &app.vk.hiZDownsampleDescPool));
-
-    for (uint32_t ping = 0; ping < 2; ++ping) {
-        app.vk.hiZDownsampleDescSets[ping].resize(setCountPerPing);
-        std::vector<VkDescriptorSetLayout> layouts(setCountPerPing, app.vk.hiZDownsampleDescLayout);
-        VkDescriptorSetAllocateInfo dsAI{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        dsAI.descriptorPool = app.vk.hiZDownsampleDescPool;
-        dsAI.descriptorSetCount = setCountPerPing;
-        dsAI.pSetLayouts = layouts.data();
-        CHECK_VK(vkAllocateDescriptorSets(app.vk.device, &dsAI, app.vk.hiZDownsampleDescSets[ping].data()));
-
-        for (uint32_t level = 0; level < setCountPerPing; ++level) {
-            VkDescriptorImageInfo imageInfos[2]{};
-            imageInfos[0].sampler = app.vk.prevDepthSampler;
-            if (level == 0u) {
-                imageInfos[0].imageView = sc.motionViews[ping];
-            } else {
-                imageInfos[0].imageView = sc.motionHalfMipViews[ping][level - 1u];
-            }
-            imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            imageInfos[1].imageView = sc.motionHalfMipViews[ping][level];
-            imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-            VkWriteDescriptorSet writes[2]{};
-            for (uint32_t i = 0; i < 2; ++i) {
-                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[i].dstSet = app.vk.hiZDownsampleDescSets[ping][level];
-                writes[i].dstBinding = i;
-                writes[i].descriptorCount = 1;
-                writes[i].pImageInfo = &imageInfos[i];
-            }
-            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            vkUpdateDescriptorSets(app.vk.device, 2, writes, 0, nullptr);
-        }
-    }
-
-    VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 4};
-    VkPipelineLayoutCreateInfo plCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plCI.setLayoutCount = 1;
-    plCI.pSetLayouts = &app.vk.hiZDownsampleDescLayout;
-    plCI.pushConstantRangeCount = 1;
-    plCI.pPushConstantRanges = &pcRange;
-    CHECK_VK(vkCreatePipelineLayout(app.vk.device, &plCI, nullptr, &app.vk.hiZDownsamplePipelineLayout));
-
-    VkShaderModuleCreateInfo smCI{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smCI.codeSize = hiz_downsample_spv_size;
-    smCI.pCode = hiz_downsample_spv;
-    VkShaderModule mod = VK_NULL_HANDLE;
-    CHECK_VK(vkCreateShaderModule(app.vk.device, &smCI, nullptr, &mod));
-
-    VkComputePipelineCreateInfo cpCI{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    cpCI.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpCI.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpCI.stage.module = mod;
-    cpCI.stage.pName = "main";
-    cpCI.layout = app.vk.hiZDownsamplePipelineLayout;
-    CHECK_VK(vkCreateComputePipelines(app.vk.device, VK_NULL_HANDLE, 1, &cpCI, nullptr, &app.vk.hiZDownsamplePipeline));
-    vkDestroyShaderModule(app.vk.device, mod, nullptr);
-}
-
 static void CreateHiZSpdPipeline(App& app) {
     EyeSwapchain& sc = app.xr.swapchains[0];
     if (sc.hiZMipCount > HIZ_SPD_MAX_MIPS) {
@@ -1599,17 +1504,6 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
                 VK_IMAGE_VIEW_TYPE_2D_ARRAY, level, 1, 0, 2);
         }
 
-        CreateImage(app.vk, sc.hiZW, sc.hiZH,
-                    VK_FORMAT_R16G16B16A16_SFLOAT,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    sc.motionHalfImages[ping], sc.motionHalfMemories[ping],
-                    2 /* arrayLayers=2 */, sc.hiZMipCount);
-        sc.motionHalfMipViews[ping].resize(sc.hiZMipCount);
-        for (uint32_t level = 0; level < sc.hiZMipCount; ++level) {
-            sc.motionHalfMipViews[ping][level] = CreateImageView(
-                app.vk, sc.motionHalfImages[ping], VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
-                VK_IMAGE_VIEW_TYPE_2D_ARRAY, level, 1, 0, 2);
-        }
     }
 
     // 各スワップチェーン画像の ImageView + Framebuffer
@@ -1653,8 +1547,6 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
     for (uint32_t ping = 0; ping < 2; ++ping) {
         TransitionImageLayoutNow(app.vk, sc.hiZImages[ping], VK_IMAGE_ASPECT_COLOR_BIT,
                                  VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 2, sc.hiZMipCount);
-        TransitionImageLayoutNow(app.vk, sc.motionHalfImages[ping], VK_IMAGE_ASPECT_COLOR_BIT,
-                                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 2, sc.hiZMipCount);
     }
 }
 
@@ -1694,7 +1586,6 @@ static void Initialize(App& app) {
     CreateVsSkinPipeline(app, w, h);
     CreateSkinCullLdsPipeline(app);
     CreateHiZSpdPipeline(app);
-    CreateHiZDownsamplePipeline(app);
     CreateQueryPool(app);
 
     app.initialized = true;
@@ -1903,8 +1794,8 @@ static void RenderStereo(App& app, uint32_t imageIdx,
                             app.vk.queryPool, TS_GFX_END);
     }
 
-    VkImageMemoryBarrier downsampleSrcBarriers[2]{};
-    for (uint32_t i = 0; i < 2; ++i) {
+    VkImageMemoryBarrier downsampleSrcBarriers[1]{};
+    for (uint32_t i = 0; i < 1; ++i) {
         downsampleSrcBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         downsampleSrcBarriers[i].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         downsampleSrcBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1915,16 +1806,10 @@ static void RenderStereo(App& app, uint32_t imageIdx,
         downsampleSrcBarriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
     }
     downsampleSrcBarriers[0].image = app.xr.swapchains[0].prevDepthImages[prevDepthWriteIdx];
-    downsampleSrcBarriers[1].image = app.xr.swapchains[0].motionImages[prevDepthWriteIdx];
     vkCmdPipelineBarrier(cmd,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 2, downsampleSrcBarriers);
-
-    if (app.vk.queryPool != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            app.vk.queryPool, TS_DOWNSAMPLE_BEGIN);
-    }
+        0, 0, nullptr, 0, nullptr, 1, downsampleSrcBarriers);
 
     struct HiZSpdPC {
         uint32_t mips;
@@ -1938,6 +1823,11 @@ static void RenderStereo(App& app, uint32_t imageIdx,
     spdPc.numWorkGroups = spdDispatchX * spdDispatchY;
     spdPc.srcWidth = app.xr.swapchains[0].width;
     spdPc.srcHeight = app.xr.swapchains[0].height;
+
+    if (app.vk.queryPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            app.vk.queryPool, TS_HIZ_BEGIN);
+    }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.hiZSpdPipeline);
     VkDescriptorSet hiZSpdDs = app.vk.hiZSpdDescSets[prevDepthWriteIdx];
@@ -1961,61 +1851,9 @@ static void RenderStereo(App& app, uint32_t imageIdx,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &hiZBarrier);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, app.vk.hiZDownsamplePipeline);
-    struct DownsamplePC {
-        uint32_t dstWidth;
-        uint32_t dstHeight;
-        uint32_t validEyeCount;
-        uint32_t _pad0;
-    } dpc{};
-    dpc.validEyeCount = 2u;
-    for (uint32_t level = 0; level < app.xr.swapchains[0].hiZMipCount; ++level) {
-        VkDescriptorSet ds = app.vk.hiZDownsampleDescSets[prevDepthWriteIdx][level];
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                app.vk.hiZDownsamplePipelineLayout, 0, 1, &ds, 0, nullptr);
-        dpc.dstWidth = std::max(1u, (app.xr.swapchains[0].hiZW + ((1u << level) - 1u)) >> level);
-        dpc.dstHeight = std::max(1u, (app.xr.swapchains[0].hiZH + ((1u << level) - 1u)) >> level);
-        vkCmdPushConstants(cmd, app.vk.hiZDownsamplePipelineLayout,
-                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dpc), &dpc);
-        vkCmdDispatch(cmd, (dpc.dstWidth + 7u) / 8u, (dpc.dstHeight + 7u) / 8u, dpc.validEyeCount);
-
-        VkImageMemoryBarrier levelBarriers[1]{};
-        levelBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        levelBarriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        levelBarriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        levelBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        levelBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        levelBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        levelBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        levelBarriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, 0, 2};
-        levelBarriers[0].image = app.xr.swapchains[0].motionHalfImages[prevDepthWriteIdx];
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, levelBarriers);
-    }
-
-    VkImageMemoryBarrier downsampleDstBarriers[2]{};
-    for (uint32_t i = 0; i < 2; ++i) {
-        downsampleDstBarriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        downsampleDstBarriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        downsampleDstBarriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        downsampleDstBarriers[i].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        downsampleDstBarriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        downsampleDstBarriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        downsampleDstBarriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        downsampleDstBarriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, app.xr.swapchains[0].hiZMipCount, 0, 2};
-    }
-    downsampleDstBarriers[0].image = app.xr.swapchains[0].hiZImages[prevDepthWriteIdx];
-    downsampleDstBarriers[1].image = app.xr.swapchains[0].motionHalfImages[prevDepthWriteIdx];
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 2, downsampleDstBarriers);
-
     if (app.vk.queryPool != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            app.vk.queryPool, TS_DOWNSAMPLE_END);
+                            app.vk.queryPool, TS_HIZ_END);
     }
 
     CHECK_VK(vkEndCommandBuffer(cmd));
@@ -2095,7 +1933,8 @@ static void RenderFrame(App& app) {
                 double nsPerTick = (double)app.vk.timestampPeriod;
                 app.lastCsMs  = (ts[TS_CS_END]  - ts[TS_CS_BEGIN])  * nsPerTick * 1e-6;
                 app.lastGfxMs = (ts[TS_GFX_END] - ts[TS_GFX_BEGIN]) * nsPerTick * 1e-6;
-                app.lastDownsampleMs = (ts[TS_DOWNSAMPLE_END] - ts[TS_DOWNSAMPLE_BEGIN]) * nsPerTick * 1e-6;
+                app.lastHiZMs = (ts[TS_HIZ_END] - ts[TS_HIZ_BEGIN]) * nsPerTick * 1e-6;
+                app.lastDownsampleMs = app.lastHiZMs;
             }
         }
 
@@ -2147,8 +1986,8 @@ static void RenderFrame(App& app) {
         double fps      = app.frameCount / elapsed;
         int    polysTotal = (int)app.vk.meshletCount * MESHLET_TILE * MESHLET_TILE * 2 * app.instCount;
         uint32_t liveTris = app.lastBfIndexCount / 3;
-        LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  DS=%.3fms  Polys=%d  LiveTris=%u  Meshlets=%u",
-             fps, avgMs, app.lastCsMs, app.lastGfxMs, app.lastDownsampleMs,
+        LOGI("[PERF] FPS=%.1f  FrameTime=%.2fms  CS=%.3fms  GFX=%.3fms  DS=%.3fms  HiZ=%.3fms  Polys=%d  LiveTris=%u  Meshlets=%u",
+             fps, avgMs, app.lastCsMs, app.lastGfxMs, app.lastDownsampleMs, app.lastHiZMs,
              polysTotal, liveTris, app.vk.meshletCount);
         app.frameMsAccum = 0.0;
         app.frameCount   = 0;
@@ -2248,10 +2087,6 @@ static void Cleanup(App& app) {
         if (app.vk.hiZSpdDescLayout)           vkDestroyDescriptorSetLayout(app.vk.device, app.vk.hiZSpdDescLayout, nullptr);
         if (app.vk.hiZSpdAtomicBuffer)         vkDestroyBuffer(app.vk.device, app.vk.hiZSpdAtomicBuffer, nullptr);
         if (app.vk.hiZSpdAtomicMemory)         vkFreeMemory(app.vk.device, app.vk.hiZSpdAtomicMemory, nullptr);
-        if (app.vk.hiZDownsamplePipeline)        vkDestroyPipeline(app.vk.device, app.vk.hiZDownsamplePipeline, nullptr);
-        if (app.vk.hiZDownsamplePipelineLayout)  vkDestroyPipelineLayout(app.vk.device, app.vk.hiZDownsamplePipelineLayout, nullptr);
-        if (app.vk.hiZDownsampleDescPool)        vkDestroyDescriptorPool(app.vk.device, app.vk.hiZDownsampleDescPool, nullptr);
-        if (app.vk.hiZDownsampleDescLayout)      vkDestroyDescriptorSetLayout(app.vk.device, app.vk.hiZDownsampleDescLayout, nullptr);
 
         for (auto& sc : app.xr.swapchains) {
             for (auto& si : sc.images) {
@@ -2272,11 +2107,6 @@ static void Cleanup(App& app) {
                 }
                 if (sc.hiZImages[ping])        vkDestroyImage(app.vk.device, sc.hiZImages[ping], nullptr);
                 if (sc.hiZMemories[ping])      vkFreeMemory(app.vk.device, sc.hiZMemories[ping], nullptr);
-                for (VkImageView v : sc.motionHalfMipViews[ping]) {
-                    if (v) vkDestroyImageView(app.vk.device, v, nullptr);
-                }
-                if (sc.motionHalfImages[ping]) vkDestroyImage(app.vk.device, sc.motionHalfImages[ping], nullptr);
-                if (sc.motionHalfMemories[ping]) vkFreeMemory(app.vk.device, sc.motionHalfMemories[ping], nullptr);
             }
             if (sc.depthView)   vkDestroyImageView(app.vk.device, sc.depthView, nullptr);
             if (sc.depthImage)  vkDestroyImage(app.vk.device, sc.depthImage, nullptr);

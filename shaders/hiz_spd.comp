@@ -1,4 +1,5 @@
 #version 450
+#extension GL_KHR_shader_subgroup_quad : require
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -41,6 +42,13 @@ ivec2 ClampSrc(ivec2 p) {
 
 float Reduce4(float a, float b, float c, float d) {
     return max(max(a, b), max(c, d));
+}
+
+float ReduceQuad(float v) {
+    return Reduce4(v,
+                   subgroupQuadSwapHorizontal(v),
+                   subgroupQuadSwapVertical(v),
+                   subgroupQuadSwapDiagonal(v));
 }
 
 float LoadSrc(ivec2 p, uint eye) {
@@ -148,64 +156,64 @@ void DownsampleMips01(uint x, uint y, uvec2 workGroupID, uint eye) {
         return;
     }
 
-    for (int i = 0; i < 4; ++i) {
-        StoreIntermediate(x, y, v[i]);
-        WorkgroupBarrier();
-        if (gl_LocalInvocationIndex < 64u) {
-            v[i] = ReduceIntermediate(uvec2(x * 2u + 0u, y * 2u + 0u),
-                                      uvec2(x * 2u + 1u, y * 2u + 0u),
-                                      uvec2(x * 2u + 0u, y * 2u + 1u),
-                                      uvec2(x * 2u + 1u, y * 2u + 1u));
-            StoreMipValue(1, ivec2(workGroupID * 16u) + ivec2(x + uint(i % 2) * 8u, y + uint(i / 2) * 8u), eye, v[i]);
-        }
-        WorkgroupBarrier();
-    }
+    v[0] = ReduceQuad(v[0]);
+    v[1] = ReduceQuad(v[1]);
+    v[2] = ReduceQuad(v[2]);
+    v[3] = ReduceQuad(v[3]);
 
-    if (gl_LocalInvocationIndex < 64u) {
-        StoreIntermediate(x + 0u, y + 0u, v[0]);
-        StoreIntermediate(x + 8u, y + 0u, v[1]);
-        StoreIntermediate(x + 0u, y + 8u, v[2]);
-        StoreIntermediate(x + 8u, y + 8u, v[3]);
+    if ((gl_LocalInvocationIndex & 3u) == 0u) {
+        StoreMipValue(1, ivec2(workGroupID * 16u) + ivec2(x >> 1u, y >> 1u), eye, v[0]);
+        StoreIntermediate(x >> 1u, y >> 1u, v[0]);
+
+        StoreMipValue(1, ivec2(workGroupID * 16u) + ivec2((x >> 1u) + 8u, y >> 1u), eye, v[1]);
+        StoreIntermediate((x >> 1u) + 8u, y >> 1u, v[1]);
+
+        StoreMipValue(1, ivec2(workGroupID * 16u) + ivec2(x >> 1u, (y >> 1u) + 8u), eye, v[2]);
+        StoreIntermediate(x >> 1u, (y >> 1u) + 8u, v[2]);
+
+        StoreMipValue(1, ivec2(workGroupID * 16u) + ivec2((x >> 1u) + 8u, (y >> 1u) + 8u), eye, v[3]);
+        StoreIntermediate((x >> 1u) + 8u, (y >> 1u) + 8u, v[3]);
     }
 }
 
 void DownsampleMip2(uint x, uint y, uvec2 workGroupID, uint eye, int mip) {
-    if (gl_LocalInvocationIndex < 64u) {
-        float v = ReduceIntermediate(uvec2(x * 2u + 0u, y * 2u + 0u),
-                                     uvec2(x * 2u + 1u, y * 2u + 0u),
-                                     uvec2(x * 2u + 0u, y * 2u + 1u),
-                                     uvec2(x * 2u + 1u, y * 2u + 1u));
-        StoreMipValue(mip, ivec2(workGroupID * 8u) + ivec2(x, y), eye, v);
-        StoreIntermediate(x * 2u + (y & 1u), y * 2u, v);
+    float v = LoadIntermediate(x, y);
+    v = ReduceQuad(v);
+    if ((gl_LocalInvocationIndex & 3u) == 0u) {
+        StoreMipValue(mip, ivec2(workGroupID * 8u) + ivec2(x >> 1u, y >> 1u), eye, v);
+        StoreIntermediate(x + ((y >> 1u) & 1u), y, v);
     }
 }
 
 void DownsampleMip3(uint x, uint y, uvec2 workGroupID, uint eye, int mip) {
-    if (gl_LocalInvocationIndex < 16u) {
-        float v = ReduceIntermediate(uvec2(x * 4u + y, y * 4u + 0u),
-                                     uvec2(x * 4u + y + 2u, y * 4u + 0u),
-                                     uvec2(x * 4u + y + 1u, y * 4u + 2u),
-                                     uvec2(x * 4u + y + 3u, y * 4u + 2u));
-        StoreMipValue(mip, ivec2(workGroupID * 4u) + ivec2(x, y), eye, v);
-        StoreIntermediate(x * 4u + y, y * 4u, v);
+    if (gl_LocalInvocationIndex < 64u) {
+        float v = LoadIntermediate(x * 2u + (y & 1u), y * 2u);
+        v = ReduceQuad(v);
+        if ((gl_LocalInvocationIndex & 3u) == 0u) {
+            StoreMipValue(mip, ivec2(workGroupID * 4u) + ivec2(x >> 1u, y >> 1u), eye, v);
+            StoreIntermediate(x * 2u + (y >> 1u), y * 2u, v);
+        }
     }
 }
 
 void DownsampleMip4(uint x, uint y, uvec2 workGroupID, uint eye, int mip) {
-    if (gl_LocalInvocationIndex < 4u) {
-        float v = ReduceIntermediate(uvec2(x * 8u + y * 2u + 0u, y * 8u + 0u),
-                                     uvec2(x * 8u + y * 2u + 4u, y * 8u + 0u),
-                                     uvec2(x * 8u + y * 2u + 1u, y * 8u + 4u),
-                                     uvec2(x * 8u + y * 2u + 5u, y * 8u + 4u));
-        StoreMipValue(mip, ivec2(workGroupID * 2u) + ivec2(x, y), eye, v);
-        StoreIntermediate(x + y * 2u, 0u, v);
+    if (gl_LocalInvocationIndex < 16u) {
+        float v = LoadIntermediate(x * 4u + y, y * 4u);
+        v = ReduceQuad(v);
+        if ((gl_LocalInvocationIndex & 3u) == 0u) {
+            StoreMipValue(mip, ivec2(workGroupID * 2u) + ivec2(x >> 1u, y >> 1u), eye, v);
+            StoreIntermediate((x >> 1u) + y, 0u, v);
+        }
     }
 }
 
 void DownsampleMip5(uvec2 workGroupID, uint eye, int mip) {
-    if (gl_LocalInvocationIndex == 0u) {
-        float v = ReduceIntermediate(uvec2(0, 0), uvec2(1, 0), uvec2(2, 0), uvec2(3, 0));
-        StoreMipValue(mip, ivec2(workGroupID), eye, v);
+    if (gl_LocalInvocationIndex < 4u) {
+        float v = LoadIntermediate(gl_LocalInvocationIndex, 0u);
+        v = ReduceQuad(v);
+        if ((gl_LocalInvocationIndex & 3u) == 0u) {
+            StoreMipValue(mip, ivec2(workGroupID), eye, v);
+        }
     }
 }
 

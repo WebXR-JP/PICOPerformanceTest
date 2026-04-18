@@ -1,30 +1,287 @@
 #version 450
+#extension GL_KHR_shader_subgroup_quad : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) uniform sampler2DArray srcMotion;
-layout(binding = 1, rgba16f) uniform writeonly image2DArray dstMotion;
+layout(binding = 1, std430) coherent buffer SpdAtomicCounter {
+    uint counter[2];
+} spdAtomic;
+layout(binding = 2, rgba16f) coherent uniform image2DArray midMip;
+layout(binding = 3,  rgba16f) uniform image2DArray mip0;
+layout(binding = 4,  rgba16f) uniform image2DArray mip1;
+layout(binding = 5,  rgba16f) uniform image2DArray mip2;
+layout(binding = 6,  rgba16f) uniform image2DArray mip3;
+layout(binding = 7,  rgba16f) uniform image2DArray mip4;
+layout(binding = 8,  rgba16f) uniform image2DArray mip5;
+layout(binding = 9,  rgba16f) uniform image2DArray mip6;
+layout(binding = 10, rgba16f) uniform image2DArray mip7;
+layout(binding = 11, rgba16f) uniform image2DArray mip8;
+layout(binding = 12, rgba16f) uniform image2DArray mip9;
+layout(binding = 13, rgba16f) uniform image2DArray mip10;
+layout(binding = 14, rgba16f) uniform image2DArray mip11;
 
 layout(push_constant) uniform PC {
-    uint dstWidth;
-    uint dstHeight;
-    uint validEyeCount;
-    uint _pad0;
+    uint mips;
+    uint numWorkGroups;
+    uint srcWidth;
+    uint srcHeight;
 } pc;
 
-void main() {
-    uvec2 dstXY = gl_GlobalInvocationID.xy;
-    uint  eye   = gl_GlobalInvocationID.z;
-    if (dstXY.x >= pc.dstWidth || dstXY.y >= pc.dstHeight || eye >= pc.validEyeCount) return;
+shared f16vec4 spdIntermediate[16][16];
+shared uint spdCounter;
 
-    ivec2 srcBase = ivec2(dstXY * 2u);
-    vec4  motionSum = vec4(0.0);
-    for (int oy = 0; oy < 2; ++oy) {
-        for (int ox = 0; ox < 2; ++ox) {
-            ivec2 srcXY = srcBase + ivec2(ox, oy);
-            motionSum += texelFetch(srcMotion, ivec3(srcXY, int(eye)), 0);
-        }
+uvec2 RemapForWaveReduction(uint a) {
+    return uvec2(((a >> 2u) & 7u) | ((a & 1u) << 3u),
+                 ((a >> 3u) & 7u) | (((a >> 1u) & 3u) << 3u));
+}
+
+ivec2 ClampSrc(ivec2 p) {
+    return clamp(p, ivec2(0), ivec2(int(pc.srcWidth) - 1, int(pc.srcHeight) - 1));
+}
+
+vec4 Reduce4(vec4 a, vec4 b, vec4 c, vec4 d) {
+    return (a + b + c + d) * 0.25;
+}
+
+vec4 ReduceQuad(vec4 v) {
+    return Reduce4(v,
+                   subgroupQuadSwapHorizontal(v),
+                   subgroupQuadSwapVertical(v),
+                   subgroupQuadSwapDiagonal(v));
+}
+
+vec4 LoadSrc(ivec2 p, uint eye) {
+    return texelFetch(srcMotion, ivec3(ClampSrc(p), int(eye)), 0);
+}
+
+vec4 LoadMid(ivec2 p, uint eye) {
+    return imageLoad(midMip, ivec3(p, int(eye)));
+}
+
+void StoreMipValue(int mip, ivec2 p, uint eye, vec4 v) {
+    switch (mip) {
+    case 0:  imageStore(mip0,  ivec3(p, int(eye)), v); break;
+    case 1:  imageStore(mip1,  ivec3(p, int(eye)), v); break;
+    case 2:  imageStore(mip2,  ivec3(p, int(eye)), v); break;
+    case 3:  imageStore(mip3,  ivec3(p, int(eye)), v); break;
+    case 4:  imageStore(mip4,  ivec3(p, int(eye)), v); break;
+    case 5:  imageStore(midMip, ivec3(p, int(eye)), v); break;
+    case 6:  imageStore(mip6,  ivec3(p, int(eye)), v); break;
+    case 7:  imageStore(mip7,  ivec3(p, int(eye)), v); break;
+    case 8:  imageStore(mip8,  ivec3(p, int(eye)), v); break;
+    case 9:  imageStore(mip9,  ivec3(p, int(eye)), v); break;
+    case 10: imageStore(mip10, ivec3(p, int(eye)), v); break;
+    case 11: imageStore(mip11, ivec3(p, int(eye)), v); break;
+    default: break;
+    }
+}
+
+vec4 LoadIntermediate(uint x, uint y) {
+    return vec4(spdIntermediate[x][y]);
+}
+
+void StoreIntermediate(uint x, uint y, vec4 v) {
+    spdIntermediate[x][y] = f16vec4(v);
+}
+
+vec4 ReduceLoad4(uvec2 base, uint eye) {
+    return Reduce4(LoadMid(ivec2(base + uvec2(0, 0)), eye),
+                   LoadMid(ivec2(base + uvec2(1, 0)), eye),
+                   LoadMid(ivec2(base + uvec2(0, 1)), eye),
+                   LoadMid(ivec2(base + uvec2(1, 1)), eye));
+}
+
+vec4 ReduceLoadSource(uvec2 base, uint eye) {
+    ivec2 tex = ivec2(base);
+    return Reduce4(LoadSrc(tex + ivec2(0, 0), eye),
+                   LoadSrc(tex + ivec2(1, 0), eye),
+                   LoadSrc(tex + ivec2(0, 1), eye),
+                   LoadSrc(tex + ivec2(1, 1), eye));
+}
+
+void WorkgroupBarrier() {
+    memoryBarrierShared();
+    barrier();
+}
+
+bool ExitWorkgroup(uint eye) {
+    if (gl_LocalInvocationIndex == 0u) {
+        memoryBarrierImage();
+        memoryBarrierBuffer();
+        spdCounter = atomicAdd(spdAtomic.counter[eye], 1u);
+    }
+    WorkgroupBarrier();
+    return spdCounter != (pc.numWorkGroups - 1u);
+}
+
+void ResetAtomic(uint eye) {
+    if (gl_LocalInvocationIndex == 0u) {
+        spdAtomic.counter[eye] = 0u;
+    }
+}
+
+void DownsampleMips01(uint x, uint y, uvec2 workGroupID, uint eye) {
+    vec4 v[4];
+
+    ivec2 tex = ivec2(workGroupID * 64u) + ivec2(x * 2u, y * 2u);
+    ivec2 pix = ivec2(workGroupID * 32u) + ivec2(x, y);
+    v[0] = ReduceLoadSource(uvec2(tex), eye);
+    StoreMipValue(0, pix, eye, v[0]);
+
+    tex = ivec2(workGroupID * 64u) + ivec2(x * 2u + 32u, y * 2u);
+    pix = ivec2(workGroupID * 32u) + ivec2(x + 16u, y);
+    v[1] = ReduceLoadSource(uvec2(tex), eye);
+    StoreMipValue(0, pix, eye, v[1]);
+
+    tex = ivec2(workGroupID * 64u) + ivec2(x * 2u, y * 2u + 32u);
+    pix = ivec2(workGroupID * 32u) + ivec2(x, y + 16u);
+    v[2] = ReduceLoadSource(uvec2(tex), eye);
+    StoreMipValue(0, pix, eye, v[2]);
+
+    tex = ivec2(workGroupID * 64u) + ivec2(x * 2u + 32u, y * 2u + 32u);
+    pix = ivec2(workGroupID * 32u) + ivec2(x + 16u, y + 16u);
+    v[3] = ReduceLoadSource(uvec2(tex), eye);
+    StoreMipValue(0, pix, eye, v[3]);
+
+    if (pc.mips <= 1u) {
+        return;
     }
 
-    imageStore(dstMotion, ivec3(dstXY, int(eye)), motionSum * 0.25);
+    v[0] = ReduceQuad(v[0]);
+    v[1] = ReduceQuad(v[1]);
+    v[2] = ReduceQuad(v[2]);
+    v[3] = ReduceQuad(v[3]);
+
+    if ((gl_LocalInvocationIndex & 3u) == 0u) {
+        StoreMipValue(1, ivec2(workGroupID * 16u) + ivec2(x >> 1u, y >> 1u), eye, v[0]);
+        StoreIntermediate(x >> 1u, y >> 1u, v[0]);
+
+        StoreMipValue(1, ivec2(workGroupID * 16u) + ivec2((x >> 1u) + 8u, y >> 1u), eye, v[1]);
+        StoreIntermediate((x >> 1u) + 8u, y >> 1u, v[1]);
+
+        StoreMipValue(1, ivec2(workGroupID * 16u) + ivec2(x >> 1u, (y >> 1u) + 8u), eye, v[2]);
+        StoreIntermediate(x >> 1u, (y >> 1u) + 8u, v[2]);
+
+        StoreMipValue(1, ivec2(workGroupID * 16u) + ivec2((x >> 1u) + 8u, (y >> 1u) + 8u), eye, v[3]);
+        StoreIntermediate((x >> 1u) + 8u, (y >> 1u) + 8u, v[3]);
+    }
+}
+
+void DownsampleMip2(uint x, uint y, uvec2 workGroupID, uint eye, int mip) {
+    vec4 v = LoadIntermediate(x, y);
+    v = ReduceQuad(v);
+    if ((gl_LocalInvocationIndex & 3u) == 0u) {
+        StoreMipValue(mip, ivec2(workGroupID * 8u) + ivec2(x >> 1u, y >> 1u), eye, v);
+        StoreIntermediate(x + ((y >> 1u) & 1u), y, v);
+    }
+}
+
+void DownsampleMip3(uint x, uint y, uvec2 workGroupID, uint eye, int mip) {
+    if (gl_LocalInvocationIndex < 64u) {
+        vec4 v = LoadIntermediate(x * 2u + (y & 1u), y * 2u);
+        v = ReduceQuad(v);
+        if ((gl_LocalInvocationIndex & 3u) == 0u) {
+            StoreMipValue(mip, ivec2(workGroupID * 4u) + ivec2(x >> 1u, y >> 1u), eye, v);
+            StoreIntermediate(x * 2u + (y >> 1u), y * 2u, v);
+        }
+    }
+}
+
+void DownsampleMip4(uint x, uint y, uvec2 workGroupID, uint eye, int mip) {
+    if (gl_LocalInvocationIndex < 16u) {
+        vec4 v = LoadIntermediate(x * 4u + y, y * 4u);
+        v = ReduceQuad(v);
+        if ((gl_LocalInvocationIndex & 3u) == 0u) {
+            StoreMipValue(mip, ivec2(workGroupID * 2u) + ivec2(x >> 1u, y >> 1u), eye, v);
+            StoreIntermediate((x >> 1u) + y, 0u, v);
+        }
+    }
+}
+
+void DownsampleMip5(uvec2 workGroupID, uint eye, int mip) {
+    if (gl_LocalInvocationIndex < 4u) {
+        vec4 v = LoadIntermediate(gl_LocalInvocationIndex, 0u);
+        v = ReduceQuad(v);
+        if ((gl_LocalInvocationIndex & 3u) == 0u) {
+            StoreMipValue(mip, ivec2(workGroupID), eye, v);
+        }
+    }
+}
+
+void DownsampleNextFour(uint x, uint y, uvec2 workGroupID, uint eye, int baseMip) {
+    if (pc.mips <= uint(baseMip)) return;
+    WorkgroupBarrier();
+    DownsampleMip2(x, y, workGroupID, eye, baseMip);
+
+    if (pc.mips <= uint(baseMip + 1)) return;
+    WorkgroupBarrier();
+    DownsampleMip3(x, y, workGroupID, eye, baseMip + 1);
+
+    if (pc.mips <= uint(baseMip + 2)) return;
+    WorkgroupBarrier();
+    DownsampleMip4(x, y, workGroupID, eye, baseMip + 2);
+
+    if (pc.mips <= uint(baseMip + 3)) return;
+    WorkgroupBarrier();
+    DownsampleMip5(workGroupID, eye, baseMip + 3);
+}
+
+void DownsampleMips67(uint x, uint y, uint eye) {
+    ivec2 tex = ivec2(x * 4u + 0u, y * 4u + 0u);
+    ivec2 pix = ivec2(x * 2u + 0u, y * 2u + 0u);
+    vec4 v0 = ReduceLoad4(uvec2(tex), eye);
+    StoreMipValue(6, pix, eye, v0);
+
+    tex = ivec2(x * 4u + 2u, y * 4u + 0u);
+    pix = ivec2(x * 2u + 1u, y * 2u + 0u);
+    vec4 v1 = ReduceLoad4(uvec2(tex), eye);
+    StoreMipValue(6, pix, eye, v1);
+
+    tex = ivec2(x * 4u + 0u, y * 4u + 2u);
+    pix = ivec2(x * 2u + 0u, y * 2u + 1u);
+    vec4 v2 = ReduceLoad4(uvec2(tex), eye);
+    StoreMipValue(6, pix, eye, v2);
+
+    tex = ivec2(x * 4u + 2u, y * 4u + 2u);
+    pix = ivec2(x * 2u + 1u, y * 2u + 1u);
+    vec4 v3 = ReduceLoad4(uvec2(tex), eye);
+    StoreMipValue(6, pix, eye, v3);
+
+    if (pc.mips <= 7u) {
+        return;
+    }
+
+    vec4 v = Reduce4(v0, v1, v2, v3);
+    StoreMipValue(7, ivec2(x, y), eye, v);
+    StoreIntermediate(x, y, v);
+}
+
+void main() {
+    uint eye = gl_WorkGroupID.z;
+    if (eye >= 2u || pc.mips == 0u) {
+        return;
+    }
+
+    uvec2 subXY = RemapForWaveReduction(gl_LocalInvocationIndex & 63u);
+    uint x = subXY.x + 8u * ((gl_LocalInvocationIndex >> 6u) & 1u);
+    uint y = subXY.y + 8u * (gl_LocalInvocationIndex >> 7u);
+    uvec2 workGroupID = gl_WorkGroupID.xy;
+
+    DownsampleMips01(x, y, workGroupID, eye);
+    DownsampleNextFour(x, y, workGroupID, eye, 2);
+
+    if (pc.mips <= 6u) {
+        return;
+    }
+    if (ExitWorkgroup(eye)) {
+        return;
+    }
+
+    ResetAtomic(eye);
+    WorkgroupBarrier();
+
+    DownsampleMips67(x, y, eye);
+    DownsampleNextFour(x, y, uvec2(0u), eye, 8);
 }
