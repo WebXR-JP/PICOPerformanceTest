@@ -20,6 +20,15 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+// VMA (Vulkan Memory Allocator) - 単一ヘッダ実装をここに展開
+// Android libvulkan.so は Vulkan 1.1+ 関数を静的エクスポートしないため、
+// vkGetInstanceProcAddr 経由で動的に解決する
+#define VMA_IMPLEMENTATION
+#define VMA_STATIC_VULKAN_FUNCTIONS 0
+#define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
+#define VMA_VULKAN_VERSION 1001000
+#include "vk_mem_alloc.h"
+
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -91,17 +100,17 @@ struct EyeSwapchain {
     std::vector<SwapchainImage> images;
     // デプスバッファ（全画像で共有）
     VkImage        depthImage  = VK_NULL_HANDLE;
-    VkDeviceMemory depthMemory = VK_NULL_HANDLE;
+    VmaAllocation  depthAlloc  = VK_NULL_HANDLE;
     VkImageView    depthView   = VK_NULL_HANDLE;
     VkImageView    depthSampleView = VK_NULL_HANDLE;
     VkImage        prevDepthImages[2]  = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkDeviceMemory prevDepthMemories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VmaAllocation  prevDepthAllocs[2]  = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkImageView    prevDepthViews[2]   = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkImage        motionImages[2]     = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkDeviceMemory motionMemories[2]   = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VmaAllocation  motionAllocs[2]     = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkImageView    motionViews[2]      = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkImage        hiZImages[2]        = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkDeviceMemory hiZMemories[2]      = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VmaAllocation  hiZAllocs[2]        = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkImageView    hiZViews[2]         = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     std::vector<VkImageView> hiZMipViews[2];
     uint32_t       hiZW                = 0;
@@ -118,10 +127,11 @@ struct VulkanCtx {
     VkCommandPool    cmdPool        = VK_NULL_HANDLE;
     VkRenderPass     renderPass     = VK_NULL_HANDLE;
     VkRenderPass     captureRenderPass = VK_NULL_HANDLE;
+    VmaAllocator     allocator      = VK_NULL_HANDLE;
     VkBuffer         vertexBuffer   = VK_NULL_HANDLE;
-    VkDeviceMemory   vertexMemory   = VK_NULL_HANDLE;
+    VmaAllocation    vertexAlloc    = VK_NULL_HANDLE;
     VkBuffer         indexBuffer    = VK_NULL_HANDLE;
-    VkDeviceMemory   indexMemory    = VK_NULL_HANDLE;
+    VmaAllocation    indexAlloc     = VK_NULL_HANDLE;
     uint32_t         indexCount     = 0;
     uint32_t         vertexCount    = 0;
     VkFence          fence          = VK_NULL_HANDLE;
@@ -130,7 +140,7 @@ struct VulkanCtx {
 
     // ---- Meshlet Buffer ----
     VkBuffer              meshletBuffer        = VK_NULL_HANDLE;
-    VkDeviceMemory        meshletMemory        = VK_NULL_HANDLE;
+    VmaAllocation         meshletAlloc         = VK_NULL_HANDLE;
     uint32_t              meshletCount         = 0;
 
     // ---- Timestamp Query ----
@@ -139,15 +149,15 @@ struct VulkanCtx {
 
     // ---- Per-triangle Backface Culling (Compute) ----
     VkBuffer              compactIndexBuffer     = VK_NULL_HANDLE;
-    VkDeviceMemory        compactIndexMemory     = VK_NULL_HANDLE;
+    VmaAllocation         compactIndexAlloc      = VK_NULL_HANDLE;
     VkBuffer              bfDrawCmdBuffer        = VK_NULL_HANDLE;
-    VkDeviceMemory        bfDrawCmdMemory        = VK_NULL_HANDLE;
+    VmaAllocation         bfDrawCmdAlloc         = VK_NULL_HANDLE;
     VkBuffer              cullStatsBuffer        = VK_NULL_HANDLE;
-    VkDeviceMemory        cullStatsMemory        = VK_NULL_HANDLE;
+    VmaAllocation         cullStatsAlloc         = VK_NULL_HANDLE;
 
     // ---- Skinning ----
     VkBuffer              boneBuffer             = VK_NULL_HANDLE;
-    VkDeviceMemory        boneMemory             = VK_NULL_HANDLE;
+    VmaAllocation         boneAlloc              = VK_NULL_HANDLE;
     uint32_t              totalBones             = 0;
     std::vector<glm::vec3> bonePivots;            // world 空間のボーン原点（回転軸）
 
@@ -168,7 +178,7 @@ struct VulkanCtx {
     VkSampler             prevDepthSampler         = VK_NULL_HANDLE;
     VkSampler             hiZSampler               = VK_NULL_HANDLE;
     VkBuffer              hiZSpdAtomicBuffer       = VK_NULL_HANDLE;
-    VkDeviceMemory        hiZSpdAtomicMemory       = VK_NULL_HANDLE;
+    VmaAllocation         hiZSpdAtomicAlloc        = VK_NULL_HANDLE;
     VkDescriptorSetLayout hiZSpdDescLayout         = VK_NULL_HANDLE;
     VkDescriptorPool      hiZSpdDescPool           = VK_NULL_HANDLE;
     VkDescriptorSet       hiZSpdDescSets[2]        = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -228,54 +238,40 @@ static void LoadXrExtFunctions(XrInstance instance) {
 // ============================================================
 // Vulkan ユーティリティ
 // ============================================================
-static uint32_t FindMemoryType(VkPhysicalDevice physDevice,
-                               uint32_t typeBits,
-                               VkMemoryPropertyFlags props) {
-    VkPhysicalDeviceMemoryProperties memProps;
-    vkGetPhysicalDeviceMemoryProperties(physDevice, &memProps);
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
-        if ((typeBits & (1u << i)) &&
-            (memProps.memoryTypes[i].propertyFlags & props) == props) {
-            return i;
-        }
-    }
-    LOGE("FindMemoryType: no suitable memory type found");
-    assert(false);
-    return 0;
-}
-
 static void CreateBuffer(VulkanCtx& vk, VkDeviceSize size,
                          VkBufferUsageFlags usage,
                          VkMemoryPropertyFlags memProps,
-                         VkBuffer& buffer, VkDeviceMemory& memory) {
+                         VkBuffer& buffer, VmaAllocation& alloc) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size        = size;
     bi.usage       = usage;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    CHECK_VK(vkCreateBuffer(vk.device, &bi, nullptr, &buffer));
 
-    VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(vk.device, buffer, &req);
-
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize  = req.size;
-    ai.memoryTypeIndex = FindMemoryType(vk.physDevice, req.memoryTypeBits, memProps);
-    CHECK_VK(vkAllocateMemory(vk.device, &ai, nullptr, &memory));
-    CHECK_VK(vkBindBufferMemory(vk.device, buffer, memory, 0));
+    VmaAllocationCreateInfo aci{};
+    aci.usage         = VMA_MEMORY_USAGE_UNKNOWN;
+    aci.requiredFlags = memProps;
+    if (memProps & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+        aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT
+                  | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+    }
+    CHECK_VK(vmaCreateBuffer(vk.allocator, &bi, &aci, &buffer, &alloc, nullptr));
 }
 
 static void UploadBufferData(VulkanCtx& vk, VkBuffer dstBuffer, const void* srcData, VkDeviceSize size) {
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-    CreateBuffer(vk, size,
-                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 stagingBuffer, stagingMemory);
+    VmaAllocation stagingAlloc = VK_NULL_HANDLE;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO;
+    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+              | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VmaAllocationInfo stagingInfo{};
+    CHECK_VK(vmaCreateBuffer(vk.allocator, &bi, &aci, &stagingBuffer, &stagingAlloc, &stagingInfo));
 
-    void* mapped = nullptr;
-    CHECK_VK(vkMapMemory(vk.device, stagingMemory, 0, size, 0, &mapped));
-    memcpy(mapped, srcData, (size_t)size);
-    vkUnmapMemory(vk.device, stagingMemory);
+    memcpy(stagingInfo.pMappedData, srcData, (size_t)size);
 
     VkCommandBufferAllocateInfo cbAI{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cbAI.commandPool = vk.cmdPool;
@@ -284,9 +280,9 @@ static void UploadBufferData(VulkanCtx& vk, VkBuffer dstBuffer, const void* srcD
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     CHECK_VK(vkAllocateCommandBuffers(vk.device, &cbAI, &cmd));
 
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    CHECK_VK(vkBeginCommandBuffer(cmd, &bi));
+    VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    CHECK_VK(vkBeginCommandBuffer(cmd, &cbi));
     VkBufferCopy region{0, 0, size};
     vkCmdCopyBuffer(cmd, stagingBuffer, dstBuffer, 1, &region);
     CHECK_VK(vkEndCommandBuffer(cmd));
@@ -298,13 +294,12 @@ static void UploadBufferData(VulkanCtx& vk, VkBuffer dstBuffer, const void* srcD
     CHECK_VK(vkQueueWaitIdle(vk.queue));
 
     vkFreeCommandBuffers(vk.device, vk.cmdPool, 1, &cmd);
-    vkDestroyBuffer(vk.device, stagingBuffer, nullptr);
-    vkFreeMemory(vk.device, stagingMemory, nullptr);
+    vmaDestroyBuffer(vk.allocator, stagingBuffer, stagingAlloc);
 }
 
 static void CreateImage(VulkanCtx& vk, uint32_t w, uint32_t h,
                         VkFormat format, VkImageUsageFlags usage,
-                        VkImage& image, VkDeviceMemory& memory,
+                        VkImage& image, VmaAllocation& alloc,
                         uint32_t arrayLayers = 1,
                         uint32_t mipLevels = 1) {
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -318,16 +313,11 @@ static void CreateImage(VulkanCtx& vk, uint32_t w, uint32_t h,
     ci.usage       = usage;
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    CHECK_VK(vkCreateImage(vk.device, &ci, nullptr, &image));
 
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(vk.device, image, &req);
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize  = req.size;
-    ai.memoryTypeIndex = FindMemoryType(vk.physDevice, req.memoryTypeBits,
-                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    CHECK_VK(vkAllocateMemory(vk.device, &ai, nullptr, &memory));
-    CHECK_VK(vkBindImageMemory(vk.device, image, memory, 0));
+    VmaAllocationCreateInfo aci{};
+    aci.usage         = VMA_MEMORY_USAGE_UNKNOWN;
+    aci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    CHECK_VK(vmaCreateImage(vk.allocator, &ci, &aci, &image, &alloc, nullptr));
 }
 
 static VkImageView CreateImageView(VulkanCtx& vk,
@@ -460,9 +450,9 @@ static void UpdateBones(VulkanCtx& vk, float time) {
     }
     void* p = nullptr;
     VkDeviceSize bSize = sizeof(uint16_t) * 16u * N;
-    vkMapMemory(vk.device, vk.boneMemory, 0, bSize, 0, &p);
+    vmaMapMemory(vk.allocator, vk.boneAlloc, &p);
     memcpy(p, boneData.data(), bSize);
-    vkUnmapMemory(vk.device, vk.boneMemory);
+    vmaUnmapMemory(vk.allocator, vk.boneAlloc);
 }
 
 static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
@@ -641,7 +631,7 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 vk.vertexBuffer, vk.vertexMemory);
+                 vk.vertexBuffer, vk.vertexAlloc);
     UploadBufferData(vk, vk.vertexBuffer, verts.data(), vSize);
 
     // インデックスバッファ（backface CS が読む、staging upload 後は DEVICE_LOCAL）
@@ -651,7 +641,7 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 vk.indexBuffer, vk.indexMemory);
+                 vk.indexBuffer, vk.indexAlloc);
     UploadBufferData(vk, vk.indexBuffer, indices.data(), iSize);
 
     // ---- Meshlet SSBO（初期化時に staging upload して DEVICE_LOCAL 化）----
@@ -660,7 +650,7 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 vk.meshletBuffer, vk.meshletMemory);
+                 vk.meshletBuffer, vk.meshletAlloc);
     UploadBufferData(vk, vk.meshletBuffer, meshlets.data(), mSize);
 
     // ---- Per-triangle backface culling 用バッファ（mode=7 で使用）----
@@ -668,7 +658,7 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
     CreateBuffer(vk, iSize,
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                 vk.compactIndexBuffer, vk.compactIndexMemory);
+                 vk.compactIndexBuffer, vk.compactIndexAlloc);
 
     // 単一の DrawCmd（indexCount は CS が atomicAdd で書く、他は固定）
     VkDeviceSize drawCmdSize = 5 * sizeof(uint32_t);
@@ -677,12 +667,12 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 vk.bfDrawCmdBuffer, vk.bfDrawCmdMemory);
+                 vk.bfDrawCmdBuffer, vk.bfDrawCmdAlloc);
 
     CreateBuffer(vk, sizeof(uint32_t) * 4u,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 vk.cullStatsBuffer, vk.cullStatsMemory);
+                 vk.cullStatsBuffer, vk.cullStatsAlloc);
 
     // ---- Bone buffer (60 cubes × 8 bones = 480 bones)、mat4 fp16（16要素/骨、列優先）、CPU が毎フレーム更新 ----
     vk.totalBones = (uint32_t)(cubeCount * BONES_PER_CUBE);
@@ -690,7 +680,7 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
     CreateBuffer(vk, bSize,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 vk.boneBuffer, vk.boneMemory);
+                 vk.boneBuffer, vk.boneAlloc);
     // 初期値は identity（fp16 対角1.0=0x3C00）
     {
         std::vector<uint16_t> identData(16u * vk.totalBones, 0u);
@@ -700,9 +690,9 @@ static void GenerateMultiCubeMesh(VulkanCtx& vk, int N, int cubeCount) {
             m[0] = m[5] = m[10] = m[15] = one;
         }
         void* p;
-        vkMapMemory(vk.device, vk.boneMemory, 0, bSize, 0, &p);
+        vmaMapMemory(vk.allocator, vk.boneAlloc, &p);
         memcpy(p, identData.data(), bSize);
-        vkUnmapMemory(vk.device, vk.boneMemory);
+        vmaUnmapMemory(vk.allocator, vk.boneAlloc);
     }
 }
 
@@ -907,6 +897,19 @@ static void CreateVulkanDevice(App& app) {
     LOGI("VkDevice created");
 
     vkGetDeviceQueue(app.vk.device, app.vk.queueFamily, 0, &app.vk.queue);
+
+    // VMA Allocator 初期化（Vulkan 関数は vkGetInstanceProcAddr 経由で動的ロード）
+    VmaVulkanFunctions vmaFns{};
+    vmaFns.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+    vmaFns.vkGetDeviceProcAddr   = vkGetDeviceProcAddr;
+    VmaAllocatorCreateInfo aci{};
+    aci.physicalDevice   = app.vk.physDevice;
+    aci.device           = app.vk.device;
+    aci.instance         = app.vk.instance;
+    aci.vulkanApiVersion = VK_API_VERSION_1_1;
+    aci.pVulkanFunctions = &vmaFns;
+    CHECK_VK(vmaCreateAllocator(&aci, &app.vk.allocator));
+    LOGI("VmaAllocator created");
 }
 
 // ---- XrSession 作成 ----
@@ -1382,12 +1385,12 @@ static void CreateHiZSpdPipeline(App& app) {
     CreateBuffer(app.vk, sizeof(uint32_t) * 2u,
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                 app.vk.hiZSpdAtomicBuffer, app.vk.hiZSpdAtomicMemory);
+                 app.vk.hiZSpdAtomicBuffer, app.vk.hiZSpdAtomicAlloc);
     {
         void* p = nullptr;
-        vkMapMemory(app.vk.device, app.vk.hiZSpdAtomicMemory, 0, sizeof(uint32_t) * 2u, 0, &p);
+        vmaMapMemory(app.vk.allocator, app.vk.hiZSpdAtomicAlloc, &p);
         std::memset(p, 0, sizeof(uint32_t) * 2u);
-        vkUnmapMemory(app.vk.device, app.vk.hiZSpdAtomicMemory);
+        vmaUnmapMemory(app.vk.allocator, app.vk.hiZSpdAtomicAlloc);
     }
 
     VkDescriptorSetLayoutBinding bindings[15]{};
@@ -1658,7 +1661,7 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
     CreateImage(app.vk, sc.width, sc.height,
                 VK_FORMAT_D32_SFLOAT,
                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                sc.depthImage, sc.depthMemory,
+                sc.depthImage, sc.depthAlloc,
                 2 /* arrayLayers=2 */);
 
     VkImageViewCreateInfo dvCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1676,7 +1679,7 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
         CreateImage(app.vk, sc.width, sc.height,
                     VK_FORMAT_R32_SFLOAT,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    sc.prevDepthImages[ping], sc.prevDepthMemories[ping],
+                    sc.prevDepthImages[ping], sc.prevDepthAllocs[ping],
                     2 /* arrayLayers=2 */);
 
         VkImageViewCreateInfo pvCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1689,7 +1692,7 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
         CreateImage(app.vk, sc.width, sc.height,
                     VK_FORMAT_R16G16B16A16_SFLOAT,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    sc.motionImages[ping], sc.motionMemories[ping],
+                    sc.motionImages[ping], sc.motionAllocs[ping],
                     2 /* arrayLayers=2 */);
         pvCI.image  = sc.motionImages[ping];
         pvCI.format = VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -1698,7 +1701,7 @@ static void CreateFrameResources(App& app, VkFormat colorFormat) {
         CreateImage(app.vk, sc.hiZW, sc.hiZH,
                     VK_FORMAT_R32_SFLOAT,
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    sc.hiZImages[ping], sc.hiZMemories[ping],
+                    sc.hiZImages[ping], sc.hiZAllocs[ping],
                     2 /* arrayLayers=2 */, sc.hiZMipCount);
         sc.hiZViews[ping] = CreateImageView(
             app.vk, sc.hiZImages[ping], VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
@@ -2175,20 +2178,18 @@ static void RenderFrame(App& app) {
         // backface 生存 index 数を CPU に読み出す（直前フレームの結果）
         {
             void* p = nullptr;
-            vkMapMemory(app.vk.device, app.vk.bfDrawCmdMemory, 0,
-                        sizeof(uint32_t), 0, &p);
+            vmaMapMemory(app.vk.allocator, app.vk.bfDrawCmdAlloc, &p);
             app.lastBfIndexCount = *reinterpret_cast<uint32_t*>(p);
-            vkUnmapMemory(app.vk.device, app.vk.bfDrawCmdMemory);
+            vmaUnmapMemory(app.vk.allocator, app.vk.bfDrawCmdAlloc);
         }
         {
             void* p = nullptr;
-            vkMapMemory(app.vk.device, app.vk.cullStatsMemory, 0,
-                        sizeof(uint32_t) * 4u, 0, &p);
+            vmaMapMemory(app.vk.allocator, app.vk.cullStatsAlloc, &p);
             uint32_t* stats = reinterpret_cast<uint32_t*>(p);
             app.lastFrustumMeshlets = stats[0];
             app.lastDepthRejectedMeshlets = stats[1];
             app.lastVisibleMeshlets = stats[2];
-            vkUnmapMemory(app.vk.device, app.vk.cullStatsMemory);
+            vmaUnmapMemory(app.vk.allocator, app.vk.cullStatsAlloc);
         }
         vkResetFences(app.vk.device, 1, &app.vk.fence);
 
@@ -2299,25 +2300,18 @@ static void Cleanup(App& app) {
         if (app.vk.captureRenderPass) vkDestroyRenderPass(app.vk.device, app.vk.captureRenderPass, nullptr);
         if (app.vk.renderPass) vkDestroyRenderPass(app.vk.device, app.vk.renderPass, nullptr);
 
-        if (app.vk.vertexBuffer)   vkDestroyBuffer(app.vk.device, app.vk.vertexBuffer, nullptr);
-        if (app.vk.vertexMemory)   vkFreeMemory(app.vk.device, app.vk.vertexMemory, nullptr);
-        if (app.vk.indexBuffer)    vkDestroyBuffer(app.vk.device, app.vk.indexBuffer, nullptr);
-        if (app.vk.indexMemory)    vkFreeMemory(app.vk.device, app.vk.indexMemory, nullptr);
+        if (app.vk.vertexBuffer)   vmaDestroyBuffer(app.vk.allocator, app.vk.vertexBuffer, app.vk.vertexAlloc);
+        if (app.vk.indexBuffer)    vmaDestroyBuffer(app.vk.allocator, app.vk.indexBuffer, app.vk.indexAlloc);
 
-        if (app.vk.meshletBuffer)  vkDestroyBuffer(app.vk.device, app.vk.meshletBuffer, nullptr);
-        if (app.vk.meshletMemory)  vkFreeMemory(app.vk.device, app.vk.meshletMemory, nullptr);
+        if (app.vk.meshletBuffer)  vmaDestroyBuffer(app.vk.allocator, app.vk.meshletBuffer, app.vk.meshletAlloc);
 
         if (app.vk.queryPool)          vkDestroyQueryPool(app.vk.device, app.vk.queryPool, nullptr);
 
-        if (app.vk.compactIndexBuffer) vkDestroyBuffer(app.vk.device, app.vk.compactIndexBuffer, nullptr);
-        if (app.vk.compactIndexMemory) vkFreeMemory(app.vk.device, app.vk.compactIndexMemory, nullptr);
-        if (app.vk.bfDrawCmdBuffer)    vkDestroyBuffer(app.vk.device, app.vk.bfDrawCmdBuffer, nullptr);
-        if (app.vk.bfDrawCmdMemory)    vkFreeMemory(app.vk.device, app.vk.bfDrawCmdMemory, nullptr);
-        if (app.vk.cullStatsBuffer)    vkDestroyBuffer(app.vk.device, app.vk.cullStatsBuffer, nullptr);
-        if (app.vk.cullStatsMemory)    vkFreeMemory(app.vk.device, app.vk.cullStatsMemory, nullptr);
+        if (app.vk.compactIndexBuffer) vmaDestroyBuffer(app.vk.allocator, app.vk.compactIndexBuffer, app.vk.compactIndexAlloc);
+        if (app.vk.bfDrawCmdBuffer)    vmaDestroyBuffer(app.vk.allocator, app.vk.bfDrawCmdBuffer, app.vk.bfDrawCmdAlloc);
+        if (app.vk.cullStatsBuffer)    vmaDestroyBuffer(app.vk.allocator, app.vk.cullStatsBuffer, app.vk.cullStatsAlloc);
 
-        if (app.vk.boneBuffer)             vkDestroyBuffer(app.vk.device, app.vk.boneBuffer, nullptr);
-        if (app.vk.boneMemory)             vkFreeMemory(app.vk.device, app.vk.boneMemory, nullptr);
+        if (app.vk.boneBuffer)             vmaDestroyBuffer(app.vk.allocator, app.vk.boneBuffer, app.vk.boneAlloc);
 
         if (app.vk.vsSkinPipeline)        vkDestroyPipeline(app.vk.device, app.vk.vsSkinPipeline, nullptr);
         if (app.vk.vsSkinCapturePipeline) vkDestroyPipeline(app.vk.device, app.vk.vsSkinCapturePipeline, nullptr);
@@ -2335,8 +2329,7 @@ static void Cleanup(App& app) {
         if (app.vk.hiZSpdPipelineLayout)       vkDestroyPipelineLayout(app.vk.device, app.vk.hiZSpdPipelineLayout, nullptr);
         if (app.vk.hiZSpdDescPool)             vkDestroyDescriptorPool(app.vk.device, app.vk.hiZSpdDescPool, nullptr);
         if (app.vk.hiZSpdDescLayout)           vkDestroyDescriptorSetLayout(app.vk.device, app.vk.hiZSpdDescLayout, nullptr);
-        if (app.vk.hiZSpdAtomicBuffer)         vkDestroyBuffer(app.vk.device, app.vk.hiZSpdAtomicBuffer, nullptr);
-        if (app.vk.hiZSpdAtomicMemory)         vkFreeMemory(app.vk.device, app.vk.hiZSpdAtomicMemory, nullptr);
+        if (app.vk.hiZSpdAtomicBuffer)         vmaDestroyBuffer(app.vk.allocator, app.vk.hiZSpdAtomicBuffer, app.vk.hiZSpdAtomicAlloc);
         if (app.vk.meshletDebugPipeline)       vkDestroyPipeline(app.vk.device, app.vk.meshletDebugPipeline, nullptr);
         if (app.vk.meshletDebugPipelineLayout) vkDestroyPipelineLayout(app.vk.device, app.vk.meshletDebugPipelineLayout, nullptr);
         if (app.vk.meshletDebugDescPool)       vkDestroyDescriptorPool(app.vk.device, app.vk.meshletDebugDescPool, nullptr);
@@ -2351,25 +2344,22 @@ static void Cleanup(App& app) {
             }
             for (uint32_t ping = 0; ping < 2; ++ping) {
                 if (sc.prevDepthViews[ping])   vkDestroyImageView(app.vk.device, sc.prevDepthViews[ping], nullptr);
-                if (sc.prevDepthImages[ping])  vkDestroyImage(app.vk.device, sc.prevDepthImages[ping], nullptr);
-                if (sc.prevDepthMemories[ping]) vkFreeMemory(app.vk.device, sc.prevDepthMemories[ping], nullptr);
+                if (sc.prevDepthImages[ping])  vmaDestroyImage(app.vk.allocator, sc.prevDepthImages[ping], sc.prevDepthAllocs[ping]);
                 if (sc.motionViews[ping])      vkDestroyImageView(app.vk.device, sc.motionViews[ping], nullptr);
-                if (sc.motionImages[ping])     vkDestroyImage(app.vk.device, sc.motionImages[ping], nullptr);
-                if (sc.motionMemories[ping])   vkFreeMemory(app.vk.device, sc.motionMemories[ping], nullptr);
+                if (sc.motionImages[ping])     vmaDestroyImage(app.vk.allocator, sc.motionImages[ping], sc.motionAllocs[ping]);
                 for (VkImageView v : sc.hiZMipViews[ping]) {
                     if (v) vkDestroyImageView(app.vk.device, v, nullptr);
                 }
                 if (sc.hiZViews[ping])         vkDestroyImageView(app.vk.device, sc.hiZViews[ping], nullptr);
-                if (sc.hiZImages[ping])        vkDestroyImage(app.vk.device, sc.hiZImages[ping], nullptr);
-                if (sc.hiZMemories[ping])      vkFreeMemory(app.vk.device, sc.hiZMemories[ping], nullptr);
+                if (sc.hiZImages[ping])        vmaDestroyImage(app.vk.allocator, sc.hiZImages[ping], sc.hiZAllocs[ping]);
             }
             if (sc.depthSampleView) vkDestroyImageView(app.vk.device, sc.depthSampleView, nullptr);
             if (sc.depthView)   vkDestroyImageView(app.vk.device, sc.depthView, nullptr);
-            if (sc.depthImage)  vkDestroyImage(app.vk.device, sc.depthImage, nullptr);
-            if (sc.depthMemory) vkFreeMemory(app.vk.device, sc.depthMemory, nullptr);
+            if (sc.depthImage)  vmaDestroyImage(app.vk.allocator, sc.depthImage, sc.depthAlloc);
         }
 
         if (app.vk.cmdPool) vkDestroyCommandPool(app.vk.device, app.vk.cmdPool, nullptr);
+        if (app.vk.allocator) vmaDestroyAllocator(app.vk.allocator);
         vkDestroyDevice(app.vk.device, nullptr);
     }
     if (app.vk.instance) vkDestroyInstance(app.vk.instance, nullptr);

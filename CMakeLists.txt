@@ -27,6 +27,17 @@ set(OPENXR_INCLUDE_DIR "${PICO_OPENXR_ROOT}/OpenXR")
 set(OPENXR_LOADER "${PICO_OPENXR_ROOT}/OpenXR/pico/loader/lib/${ANDROID_ABI}/libopenxr_loader.so")
 set(GLM_INCLUDE_DIR "C:/PICO_SDK/3rdParty/glm-0.9.9.8")
 
+# ---- Vulkan Memory Allocator (header-only) ----
+include(FetchContent)
+FetchContent_Declare(
+    vma
+    GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+    GIT_TAG        v3.1.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(vma)
+set(VMA_INCLUDE_DIR "${vma_SOURCE_DIR}/include")
+
 # ---- glslc（ホスト PC 上で動作するシェーダーコンパイラ）----
 find_program(GLSLC glslc
     HINTS
@@ -100,6 +111,7 @@ add_library(PICOPerformanceTest MODULE
 target_include_directories(PICOPerformanceTest PRIVATE
     "${OPENXR_INCLUDE_DIR}"
     "${GLM_INCLUDE_DIR}"
+    "${VMA_INCLUDE_DIR}"
     "${SHADER_GEN_DIR}"
     ${ANDROID_NDK}/sources/android/native_app_glue
 )
